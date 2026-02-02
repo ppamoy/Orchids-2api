@@ -6,5 +6,10 @@
   "redis_password": "",
   "redis_db": 0,
   "redis_prefix": "orchids:",
-  "debug_enabled": true
+  "debug_enabled": true,
+  "cache_strategy": "moderate",
+  "context_max_tokens": 100000,
+  "max_retries": 3,
+  "tool_call_mode": "proxy",
+  "adaptive_timeout": true
 }
