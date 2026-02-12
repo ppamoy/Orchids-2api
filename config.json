@@ -43,6 +43,9 @@
     "data",
     ".claude"
   ],
+  "grok_api_base_url": "https://grok.com",
+  "grok_user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+  "grok_cf_clearance": "",
   "warp_disable_tools": false,
   "admin_token": "",
   "max_retries": 3,
