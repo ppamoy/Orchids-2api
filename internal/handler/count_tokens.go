@@ -5,7 +5,7 @@ import (
 	"net/http"
 
 	"orchids-api/internal/debug"
-	"orchids-api/internal/prompt"
+	"orchids-api/internal/orchids"
 )
 
 // HandleCountTokens handles /v1/messages/count_tokens requests.
@@ -25,30 +25,32 @@ func (h *Handler) HandleCountTokens(w http.ResponseWriter, r *http.Request) {
 	defer logger.Close()
 	logger.LogIncomingRequest(req)
 
-	conversationKey := conversationKeyForRequest(r, req)
-	opts := prompt.PromptOptions{
-		Context:          r.Context(),
-		ConversationID:   conversationKey,
-		MaxTokens:        h.config.ContextMaxTokens,
-		SummaryMaxTokens: h.config.ContextSummaryMaxTokens,
-		KeepTurns:        h.config.ContextKeepTurns,
-		SummaryCache:     h.summaryCache,
+	maxTokens := 12000
+	if h.config != nil && h.config.ContextMaxTokens > 0 {
+		maxTokens = h.config.ContextMaxTokens
 	}
-
-	builtPrompt := prompt.BuildPromptV2WithOptions(prompt.ClaudeAPIRequest{
-		Model:    req.Model,
-		Messages: req.Messages,
-		System:   req.System,
-		Tools:    req.Tools,
-		Stream:   false,
-	}, opts)
-
-	inputTokens := h.estimateInputTokens(r.Context(), req.Model, builtPrompt)
+	builtPrompt, aiClientHistory, meta := orchids.BuildAIClientPromptAndHistoryWithMeta(
+		req.Messages,
+		req.System,
+		req.Model,
+		true, /* noThinking */
+		"",   /* workdir */
+		maxTokens,
+	)
+	breakdown := estimateInputTokenBreakdown(builtPrompt, aiClientHistory, req.Tools)
 
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(map[string]int{
-		"input_tokens": inputTokens,
-	}); err != nil {
+	resp := map[string]interface{}{
+		"input_tokens":   breakdown.Total,
+		"prompt_profile": meta.Profile,
+		"breakdown": map[string]int{
+			"base_prompt_tokens":    breakdown.BasePromptTokens,
+			"system_context_tokens": breakdown.SystemContextTokens,
+			"history_tokens":        breakdown.HistoryTokens,
+			"tools_tokens":          breakdown.ToolsTokens,
+		},
+	}
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		// Log error but we can't do much else since headers are written
 		_ = err
 	}

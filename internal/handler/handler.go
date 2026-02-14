@@ -23,7 +23,6 @@ import (
 	"orchids-api/internal/orchids"
 	"orchids-api/internal/prompt"
 	"orchids-api/internal/store"
-	"orchids-api/internal/summarycache"
 	"orchids-api/internal/tokencache"
 	"orchids-api/internal/upstream"
 	"orchids-api/internal/util"
@@ -34,20 +33,18 @@ type Handler struct {
 	config       *config.Config
 	client       UpstreamClient
 	loadBalancer *loadbalancer.LoadBalancer
-	summaryCache prompt.SummaryCache
-	summaryStats *summarycache.Stats
-	summaryLog   bool
 	tokenCache   tokencache.Cache
 
-	sessionWorkdirsMu sync.RWMutex
-	sessionWorkdirs   map[string]string    // Map conversationKey -> string (workdir)
-	sessionConvIDs    map[string]string    // Map conversationKey -> upstream warp conversationID
-	sessionLastAccess map[string]time.Time // Map conversationKey -> last access time
+	sessionWorkdirs   *ShardedMap[string]    // Map conversationKey -> string (workdir)
+	sessionConvIDs    *ShardedMap[string]    // Map conversationKey -> upstream warp conversationID
+	sessionLastAccess *ShardedMap[time.Time] // Map conversationKey -> last access time
+	sessionCleanupMu  sync.Mutex             // Protects sessionCleanupRun
 	sessionCleanupRun time.Time
 
 	recentReqMu      sync.Mutex
 	recentRequests   map[string]*recentRequest
 	recentCleanupRun time.Time
+	recentCleaner    *AsyncCleaner // 异步清理器
 }
 
 type UpstreamClient interface {
@@ -88,24 +85,24 @@ func NewWithLoadBalancer(cfg *config.Config, lb *loadbalancer.LoadBalancer) *Han
 	h := &Handler{
 		config:            cfg,
 		loadBalancer:      lb,
-		sessionWorkdirs:   make(map[string]string),
-		sessionConvIDs:    make(map[string]string),
-		sessionLastAccess: make(map[string]time.Time),
+		sessionWorkdirs:   NewShardedMap[string](),
+		sessionConvIDs:    NewShardedMap[string](),
+		sessionLastAccess: NewShardedMap[time.Time](),
 		recentRequests:    make(map[string]*recentRequest),
 	}
 	if cfg != nil {
-		h.summaryLog = cfg.SummaryCacheLog
 		h.client = orchids.New(cfg)
 	}
+	
+	// 启动异步清理器，每 5 秒清理一次过期请求
+	h.recentCleaner = NewAsyncCleaner(5 * time.Second)
+	h.recentCleaner.Start(func() {
+		h.recentReqMu.Lock()
+		defer h.recentReqMu.Unlock()
+		h.cleanupRecentLocked(time.Now())
+	})
+	
 	return h
-}
-
-func (h *Handler) SetSummaryCache(cache prompt.SummaryCache) {
-	h.summaryCache = cache
-}
-
-func (h *Handler) SetSummaryStats(stats *summarycache.Stats) {
-	h.summaryStats = stats
 }
 
 func (h *Handler) SetTokenCache(cache tokencache.Cache) {
@@ -149,11 +146,9 @@ func (h *Handler) registerRequest(hash string) (bool, bool) {
 		}
 		rec.last = now
 		rec.inFlight++
-		h.cleanupRecentLocked(now)
 		return false, false
 	}
 	h.recentRequests[hash] = &recentRequest{last: now, inFlight: 1}
-	h.cleanupRecentLocked(now)
 	return false, false
 }
 
@@ -169,7 +164,6 @@ func (h *Handler) finishRequest(hash string) {
 		rec.inFlight--
 	}
 	rec.last = now
-	h.cleanupRecentLocked(now)
 }
 
 func (h *Handler) cleanupRecentLocked(now time.Time) {
@@ -329,16 +323,18 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	conversationKey := conversationKeyForRequest(r, req)
 
 	forcedChannel := channelFromPath(r.URL.Path)
+	if err := h.validateModelAvailability(r.Context(), req.Model, forcedChannel); err != nil {
+		h.writeErrorResponse(w, "invalid_request_error", err.Error(), http.StatusBadRequest)
+		return
+	}
 	effectiveWorkdir, prevWorkdir, workdirChanged := h.resolveWorkdir(r, req, conversationKey)
 	if workdirChanged {
 		slog.Warn("检测到工作目录变化，已清空历史", "prev", prevWorkdir, "next", effectiveWorkdir, "session", conversationKey)
 		req.Messages = resetMessagesForNewWorkdir(req.Messages)
 		// 工作目录变化时清除上游会话ID，强制开启新对话
 		if conversationKey != "" {
-			h.sessionWorkdirsMu.Lock()
-			delete(h.sessionConvIDs, conversationKey)
-			delete(h.sessionLastAccess, conversationKey)
-			h.sessionWorkdirsMu.Unlock()
+			h.sessionConvIDs.Delete(conversationKey)
+			h.sessionLastAccess.Delete(conversationKey)
 		}
 	}
 
@@ -374,11 +370,8 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		// Warp passthrough mode: do not trim history/tool results.
 		slog.Debug("Checkpoint: warp passthrough, skip trim/sanitize")
 	} else {
-		// Orchids: Compress HUGE tool results (>100KB) to prevent upstream 413/Timeout
-		// 100KB limit is generous enough for most code but prevents MB-sized payloads.
-		slog.Debug("Checkpoint: compressing tool results")
-		compressed, _ := compressToolResults(req.Messages, 102400, "orchids")
-		req.Messages = compressed
+		// Orchids: do not trim message/tool_result content to preserve full context.
+		slog.Debug("Checkpoint: orchids passthrough, skip context trimming")
 		if sanitized, changed := sanitizeSystemItems(req.System, false, h.config); changed {
 			req.System = sanitized
 			slog.Info("系统提示已移除 cc_entrypoint", "mode", h.config.OrchidsCCEntrypointMode, "warp", false)
@@ -397,11 +390,6 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			h.loadBalancer.ReleaseConnection(trackedAccountID)
 		}
 	}()
-
-	var hitsBefore, missesBefore uint64
-	if h.summaryStats != nil && h.summaryLog {
-		hitsBefore, missesBefore = h.summaryStats.Snapshot()
-	}
 
 	suggestionMode := isSuggestionMode(req.Messages)
 	noThinking := suggestionMode || h.config.SuppressThinking
@@ -426,55 +414,32 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	if strings.TrimSpace(effectiveWorkdir) != "" {
 		summaryKey = conversationKey + "|" + strings.TrimSpace(effectiveWorkdir)
 	}
-	opts := prompt.PromptOptions{
-		Context:          r.Context(),
-		ConversationID:   summaryKey,
-		MaxTokens:        h.config.ContextMaxTokens,
-		SummaryMaxTokens: h.config.ContextSummaryMaxTokens,
-		KeepTurns:        h.config.ContextKeepTurns,
-		SummaryCache:     h.summaryCache,
-		ProjectRoot:      effectiveWorkdir,
-	}
+	// NOTE: AIClient mode handles its own context budgeting; legacy PromptOptions are deprecated.
+	_ = summaryKey
+	_ = effectiveWorkdir
 
 	slog.Debug("Starting prompt build...", "conversation_id", conversationKey)
+	// Orchids: always use AIClient mode (other implementations are deprecated/removed).
 	isOrchidsAIClient := false
-	if _, ok := apiClient.(*orchids.Client); ok && strings.EqualFold(strings.TrimSpace(h.config.OrchidsImpl), "aiclient") {
+	if _, ok := apiClient.(*orchids.Client); ok {
 		isOrchidsAIClient = true
 	}
 
 	var aiClientHistory []map[string]string
 	var builtPrompt string
+	var promptMeta orchids.AIClientPromptMeta
 	if isOrchidsAIClient {
-		builtPrompt, aiClientHistory = orchids.BuildAIClientPromptAndHistory(req.Messages, req.System, req.Model, noThinking, effectiveWorkdir)
+		builtPrompt, aiClientHistory, promptMeta = orchids.BuildAIClientPromptAndHistoryWithMeta(req.Messages, req.System, req.Model, noThinking, effectiveWorkdir, h.config.ContextMaxTokens)
 	} else {
-		builtPrompt = prompt.BuildPromptV2WithOptions(prompt.ClaudeAPIRequest{
-			Model:    req.Model,
-			Messages: req.Messages,
-			System:   req.System,
-			Tools:    effectiveTools,
-			Stream:   req.Stream,
-		}, opts)
+		// Non-AIClient routing is deprecated/removed.
+		builtPrompt, aiClientHistory, promptMeta = orchids.BuildAIClientPromptAndHistoryWithMeta(req.Messages, req.System, req.Model, noThinking, effectiveWorkdir, h.config.ContextMaxTokens)
 	}
 	buildDuration := time.Since(startBuild)
 	slog.Debug("Prompt build completed", "duration", buildDuration)
 	if h.config.DebugEnabled {
-		buildLabel := "BuildPromptV2WithOptions"
-		if isOrchidsAIClient {
-			buildLabel = "BuildAIClientPromptAndHistory"
-		}
+		buildLabel := "BuildAIClientPromptAndHistory"
 		slog.Info("[Performance] "+buildLabel, "duration", buildDuration)
-		if opts.ProjectContext != "" {
-			slog.Debug("Project context injected", "context", opts.ProjectContext)
-		}
-	}
-
-	if h.summaryStats != nil && h.summaryLog {
-		hitsAfter, missesAfter := h.summaryStats.Snapshot()
-		hitDelta := hitsAfter - hitsBefore
-		missDelta := missesAfter - missesBefore
-		if hitDelta > 0 || missDelta > 0 {
-			slog.Debug("summary_cache", "hit", hitDelta, "miss", missDelta)
-		}
+		// Project context injection is deprecated (non-AIClient path removed).
 	}
 
 	// 映射模型
@@ -525,8 +490,22 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	slog.Debug("Checkpoint: LogConvertedPrompt")
 	logger.LogConvertedPrompt(builtPrompt)
 
-	// Token 计数
-	inputTokens := h.estimateInputTokens(r.Context(), req.Model, builtPrompt)
+	breakdown := estimateInputTokenBreakdown(builtPrompt, aiClientHistory, effectiveTools)
+	slog.Info(
+		"Input token breakdown (estimated)",
+		"prompt_profile", promptMeta.Profile,
+		"base_prompt_tokens", breakdown.BasePromptTokens,
+		"system_context_tokens", breakdown.SystemContextTokens,
+		"history_tokens", breakdown.HistoryTokens,
+		"tools_tokens", breakdown.ToolsTokens,
+		"estimated_total_input_tokens", breakdown.Total,
+	)
+
+	// Token 计数（用于前置 usage 展示）
+	inputTokens := breakdown.Total
+	if inputTokens <= 0 {
+		inputTokens = h.estimateInputTokens(r.Context(), req.Model, builtPrompt)
+	}
 
 	// Detect Response Format (Anthropic vs OpenAI)
 	responseFormat := adapter.DetectResponseFormat(r.URL.Path)
@@ -541,11 +520,9 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		if conversationKey == "" {
 			return
 		}
-		h.sessionWorkdirsMu.Lock()
-		h.sessionConvIDs[conversationKey] = id
-		h.sessionLastAccess[conversationKey] = time.Now()
-		h.cleanupSessionWorkdirsLocked()
-		h.sessionWorkdirsMu.Unlock()
+		h.sessionConvIDs.Set(conversationKey, id)
+		h.sessionLastAccess.Set(conversationKey, time.Now())
+		h.cleanupSessionWorkdirs()
 		slog.Debug("Warp conversationID captured", "key", conversationKey, "id", id)
 	}
 	defer sh.release()
@@ -598,11 +575,9 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		// 复用上游返回的 conversationID，保持会话连续性
 		chatSessionID := ""
 		if conversationKey != "" {
-			h.sessionWorkdirsMu.Lock()
-			chatSessionID = h.sessionConvIDs[conversationKey]
-			h.sessionLastAccess[conversationKey] = time.Now()
-			h.cleanupSessionWorkdirsLocked()
-			h.sessionWorkdirsMu.Unlock()
+			chatSessionID, _ = h.sessionConvIDs.Get(conversationKey)
+			h.sessionLastAccess.Set(conversationKey, time.Now())
+			h.cleanupSessionWorkdirs()
 		}
 		if chatSessionID == "" {
 			chatSessionID = "chat_" + randomSessionID()
@@ -642,13 +617,39 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			if sender, ok := apiClient.(UpstreamPayloadClient); ok {
 				slog.Info("Using SendRequestWithPayload")
 				warpBatches := [][]prompt.Message{upstreamMessages}
-				if isWarpRequest && h.config.WarpSplitToolResults {
+				if isWarpRequest {
+					// Enforce hard token budget for Warp requests to avoid runaway context cost.
 					if _, isWarp := apiClient.(*warp.Client); isWarp {
-						batches, total := splitWarpToolResults(upstreamMessages, 1)
-						if len(batches) > 1 {
-							slog.Info("Warp 工具结果分批发送", "total_tool_results", total, "batches", len(batches))
+						budget := h.config.ContextMaxTokens
+						if budget <= 0 || budget > 12000 {
+							budget = 12000
 						}
-						warpBatches = batches
+						trimmed, before, after, compressed, summarized, dropped := enforceWarpBudget(builtPrompt, upstreamMessages, budget)
+						if before.Total != after.Total || compressed > 0 || summarized > 0 || dropped > 0 {
+							slog.Info(
+								"Warp budget applied",
+								"budget", budget,
+								"tokens_before", before.Total,
+								"tokens_after", after.Total,
+								"prompt_tokens", after.PromptTokens,
+								"messages_tokens", after.MessagesTokens,
+								"tool_tokens", after.ToolTokens,
+								"compressed_blocks", compressed,
+								"summarized_messages", summarized,
+								"dropped_messages", dropped,
+							)
+						}
+						upstreamMessages = trimmed
+					}
+
+					if h.config.WarpSplitToolResults {
+						if _, isWarp := apiClient.(*warp.Client); isWarp {
+							batches, total := splitWarpToolResults(upstreamMessages, 1)
+							if len(batches) > 1 {
+								slog.Info("Warp 工具结果分批发送", "total_tool_results", total, "batches", len(batches))
+							}
+							warpBatches = batches
+						}
 					}
 				}
 				noopHandler := func(msg upstream.SSEMessage) {
@@ -678,6 +679,11 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			if err == nil {
 				sh.forceFinishIfMissing()
 				break
+			}
+			if sh.hasAnyOutput() {
+				slog.Warn("Upstream failed after partial output, skip retry to avoid duplicated token billing", "error", err)
+				sh.finishResponse("end_turn")
+				return
 			}
 
 			// Check for non-retriable errors

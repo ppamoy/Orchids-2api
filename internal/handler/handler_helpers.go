@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"path/filepath"
@@ -19,9 +20,7 @@ import (
 func (h *Handler) resolveWorkdir(r *http.Request, req ClaudeRequest, conversationKey string) (string, string, bool) {
 	prevWorkdir := ""
 	if conversationKey != "" {
-		h.sessionWorkdirsMu.RLock()
-		prevWorkdir = h.sessionWorkdirs[conversationKey]
-		h.sessionWorkdirsMu.RUnlock()
+		prevWorkdir, _ = h.sessionWorkdirs.Get(conversationKey)
 	}
 
 	// Prefer explicit workdir from request payload/header/system.
@@ -45,11 +44,9 @@ func (h *Handler) resolveWorkdir(r *http.Request, req ClaudeRequest, conversatio
 
 	// Persist for future turns in this session
 	if dynamicWorkdir != "" && conversationKey != "" {
-		h.sessionWorkdirsMu.Lock()
-		h.sessionWorkdirs[conversationKey] = dynamicWorkdir
-		h.sessionLastAccess[conversationKey] = time.Now()
-		h.cleanupSessionWorkdirsLocked()
-		h.sessionWorkdirsMu.Unlock()
+		h.sessionWorkdirs.Set(conversationKey, dynamicWorkdir)
+		h.sessionLastAccess.Set(conversationKey, time.Now())
+		h.cleanupSessionWorkdirs()
 	}
 
 	if dynamicWorkdir != "" {
@@ -104,6 +101,33 @@ func (h *Handler) selectAccount(ctx context.Context, model, forcedChannel string
 	return nil, nil, errors.New("no client configured")
 }
 
+func (h *Handler) validateModelAvailability(ctx context.Context, modelID, forcedChannel string) error {
+	if h == nil || h.loadBalancer == nil || h.loadBalancer.Store == nil {
+		return nil
+	}
+	modelID = strings.TrimSpace(modelID)
+	if modelID == "" {
+		return nil
+	}
+	m, err := h.loadBalancer.Store.GetModelByModelID(ctx, modelID)
+	if err != nil || m == nil {
+		return fmt.Errorf("model not found")
+	}
+	if !m.Status.Enabled() {
+		return fmt.Errorf("model not available")
+	}
+	if forcedChannel != "" {
+		mChannel := strings.TrimSpace(m.Channel)
+		if mChannel == "" {
+			mChannel = "orchids"
+		}
+		if !strings.EqualFold(mChannel, forcedChannel) {
+			return fmt.Errorf("model not found")
+		}
+	}
+	return nil
+}
+
 func (h *Handler) updateAccountStats(account *store.Account, inputTokens, outputTokens int) {
 	if account == nil || h.loadBalancer == nil {
 		return
@@ -151,21 +175,42 @@ const (
 	sessionMaxAge          = 30 * time.Minute
 )
 
-// cleanupSessionWorkdirsLocked removes stale session entries.
-// Must be called with sessionWorkdirsMu held for writing.
-func (h *Handler) cleanupSessionWorkdirsLocked() {
+// cleanupSessionWorkdirs removes stale session entries.
+// Uses ShardedMap's Range method to iterate and collect keys to delete.
+func (h *Handler) cleanupSessionWorkdirs() {
 	now := time.Now()
-	if len(h.sessionWorkdirs) < sessionMaxSize && now.Sub(h.sessionCleanupRun) < sessionCleanupInterval {
+
+	// Use mutex to protect cleanup timing check
+	h.sessionCleanupMu.Lock()
+	// Estimate size by counting entries (this is approximate for sharded maps)
+	entryCount := 0
+	h.sessionLastAccess.Range(func(key string, _ time.Time) bool {
+		entryCount++
+		return entryCount < sessionMaxSize // Stop early if we know we're under limit
+	})
+
+	if entryCount < sessionMaxSize && now.Sub(h.sessionCleanupRun) < sessionCleanupInterval {
+		h.sessionCleanupMu.Unlock()
 		return
 	}
-	for key, lastAccess := range h.sessionLastAccess {
-		if now.Sub(lastAccess) > sessionMaxAge {
-			delete(h.sessionWorkdirs, key)
-			delete(h.sessionConvIDs, key)
-			delete(h.sessionLastAccess, key)
-		}
-	}
 	h.sessionCleanupRun = now
+	h.sessionCleanupMu.Unlock()
+
+	// Collect keys to delete
+	var keysToDelete []string
+	h.sessionLastAccess.Range(func(key string, lastAccess time.Time) bool {
+		if now.Sub(lastAccess) > sessionMaxAge {
+			keysToDelete = append(keysToDelete, key)
+		}
+		return true
+	})
+
+	// Delete stale entries from all three maps
+	for _, key := range keysToDelete {
+		h.sessionWorkdirs.Delete(key)
+		h.sessionConvIDs.Delete(key)
+		h.sessionLastAccess.Delete(key)
+	}
 }
 
 type upstreamErrorClass struct {

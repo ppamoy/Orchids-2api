@@ -19,13 +19,12 @@ import (
 	"orchids-api/internal/clerk"
 	"orchids-api/internal/config"
 	"orchids-api/internal/debug"
+	"orchids-api/internal/grok"
 	"orchids-api/internal/handler"
 	"orchids-api/internal/loadbalancer"
 	"orchids-api/internal/middleware"
 	"orchids-api/internal/orchids"
-	"orchids-api/internal/prompt"
 	"orchids-api/internal/store"
-	"orchids-api/internal/summarycache"
 	"orchids-api/internal/template"
 	"orchids-api/internal/tokencache"
 	"orchids-api/internal/warp"
@@ -101,39 +100,13 @@ func main() {
 	lb := loadbalancer.NewWithCacheTTL(s, time.Duration(cfg.LoadBalancerCacheTTL)*time.Second)
 	apiHandler := api.New(s, cfg.AdminUser, cfg.AdminPass, cfg, resolvedCfgPath)
 	h := handler.NewWithLoadBalancer(cfg, lb)
+	grokHandler := grok.NewHandler(cfg, lb)
 
 	tokenCache := tokencache.NewMemoryCache(time.Duration(cfg.CacheTTL)*time.Minute, 10000)
 	h.SetTokenCache(tokenCache)
 	apiHandler.SetTokenCache(tokenCache)
 
-	cacheMode := strings.ToLower(cfg.SummaryCacheMode)
-	if cacheMode != "off" {
-		stats := summarycache.NewStats()
-		h.SetSummaryStats(stats)
-
-		var baseCache prompt.SummaryCache
-		switch cacheMode {
-		case "redis":
-			baseCache = summarycache.NewRedisCache(
-				cfg.SummaryCacheRedisAddr,
-				cfg.SummaryCacheRedisPass,
-				cfg.SummaryCacheRedisDB,
-				time.Duration(cfg.SummaryCacheTTLSeconds)*time.Second,
-				cfg.SummaryCacheRedisPrefix,
-			)
-		default:
-			if cfg.SummaryCacheSize > 0 {
-				baseCache = summarycache.NewMemoryCache(cfg.SummaryCacheSize, time.Duration(cfg.SummaryCacheTTLSeconds)*time.Second)
-			}
-		}
-
-		if baseCache != nil {
-			instrumented := summarycache.NewInstrumentedCache(baseCache, stats)
-			h.SetSummaryCache(instrumented)
-			apiHandler.SetSummaryCache(instrumented)
-		}
-	}
-	slog.Info("Summary cache mode", "mode", cacheMode)
+	// Summary cache disabled (removed).
 
 	// Initialize template renderer
 	tmplRenderer, err := template.NewRenderer()
@@ -155,6 +128,8 @@ func main() {
 	mux.HandleFunc("/orchids/v1/models/", h.HandleModelByID)
 	mux.HandleFunc("/warp/v1/models", h.HandleModels)
 	mux.HandleFunc("/warp/v1/models/", h.HandleModelByID)
+	mux.HandleFunc("/grok/v1/models", h.HandleModels)
+	mux.HandleFunc("/grok/v1/models/", h.HandleModelByID)
 	// Unified Model Routes (All channels)
 	mux.HandleFunc("/v1/models", h.HandleModels)
 	mux.HandleFunc("/v1/models/", h.HandleModelByID)
@@ -162,6 +137,10 @@ func main() {
 	// OpenAI Compatibility - Channel Specific
 	mux.HandleFunc("/orchids/v1/chat/completions", limiter.Limit(h.HandleMessages))
 	mux.HandleFunc("/warp/v1/chat/completions", limiter.Limit(h.HandleMessages))
+	mux.HandleFunc("/grok/v1/chat/completions", limiter.Limit(grokHandler.HandleChatCompletions))
+	mux.HandleFunc("/grok/v1/images/generations", limiter.Limit(grokHandler.HandleImagesGenerations))
+	mux.HandleFunc("/grok/v1/images/edits", limiter.Limit(grokHandler.HandleImagesEdits))
+	mux.HandleFunc("/grok/v1/files/", grokHandler.HandleFiles)
 
 	// Public routes
 	mux.HandleFunc("/api/login", apiHandler.HandleLogin)
@@ -179,6 +158,15 @@ func main() {
 	mux.HandleFunc("/api/config", middleware.SessionAuth(cfg.AdminPass, cfg.AdminToken, apiHandler.HandleConfig))
 	mux.HandleFunc("/api/config/cache/stats", middleware.SessionAuth(cfg.AdminPass, cfg.AdminToken, apiHandler.HandleCacheStats))
 	mux.HandleFunc("/api/config/cache/clear", middleware.SessionAuth(cfg.AdminPass, cfg.AdminToken, apiHandler.HandleCacheClear))
+	mux.HandleFunc("/api/v1/admin/voice/token", middleware.SessionAuth(cfg.AdminPass, cfg.AdminToken, grokHandler.HandleAdminVoiceToken))
+	mux.HandleFunc("/api/v1/admin/imagine/start", middleware.SessionAuth(cfg.AdminPass, cfg.AdminToken, grokHandler.HandleAdminImagineStart))
+	mux.HandleFunc("/api/v1/admin/imagine/stop", middleware.SessionAuth(cfg.AdminPass, cfg.AdminToken, grokHandler.HandleAdminImagineStop))
+	mux.HandleFunc("/api/v1/admin/imagine/sse", middleware.SessionAuth(cfg.AdminPass, cfg.AdminToken, grokHandler.HandleAdminImagineSSE))
+	mux.HandleFunc("/api/v1/admin/imagine/ws", middleware.SessionAuth(cfg.AdminPass, cfg.AdminToken, grokHandler.HandleAdminImagineWS))
+	mux.HandleFunc("/api/v1/admin/cache", middleware.SessionAuth(cfg.AdminPass, cfg.AdminToken, grokHandler.HandleAdminCache))
+	mux.HandleFunc("/api/v1/admin/cache/list", middleware.SessionAuth(cfg.AdminPass, cfg.AdminToken, grokHandler.HandleAdminCacheList))
+	mux.HandleFunc("/api/v1/admin/cache/clear", middleware.SessionAuth(cfg.AdminPass, cfg.AdminToken, grokHandler.HandleAdminCacheClear))
+	mux.HandleFunc("/api/v1/admin/cache/item/delete", middleware.SessionAuth(cfg.AdminPass, cfg.AdminToken, grokHandler.HandleAdminCacheItemDelete))
 
 	// Protected Web UI
 	staticHandler := http.StripPrefix(cfg.AdminPath, web.StaticHandler())
@@ -331,6 +319,11 @@ func main() {
 					}
 					continue
 				}
+				// Grok accounts store SSO tokens in ClientCookie and are not Clerk-backed.
+				// Skip auto-refresh to avoid false 401s and cooldown.
+				if strings.EqualFold(acc.AccountType, "grok") {
+					continue
+				}
 				if strings.TrimSpace(acc.ClientCookie) == "" {
 					continue
 				}
@@ -368,6 +361,25 @@ func main() {
 				}
 				if info.ClientCookie != "" {
 					acc.ClientCookie = info.ClientCookie
+				}
+
+				// Sync Orchids credits via RSC Server Action
+				if info.JWT != "" {
+					creditsCtx, creditsCancel := context.WithTimeout(context.Background(), 15*time.Second)
+					uid := info.UserID
+					if strings.TrimSpace(uid) == "" {
+						uid = acc.UserID
+					}
+					creditsInfo, creditsErr := orchids.FetchCredits(creditsCtx, info.JWT, uid)
+					creditsCancel()
+					if creditsErr != nil {
+						slog.Warn("Orchids credits sync failed", "account", acc.Name, "error", creditsErr)
+					} else if creditsInfo != nil {
+						acc.Subscription = strings.ToLower(creditsInfo.Plan)
+						acc.UsageCurrent = creditsInfo.Credits
+						acc.UsageLimit = orchids.PlanCreditLimit(creditsInfo.Plan)
+						slog.Debug("Orchids credits synced", "account", acc.Name, "credits", acc.UsageCurrent, "limit", acc.UsageLimit, "plan", acc.Subscription)
+					}
 				}
 
 				if err := s.UpdateAccount(context.Background(), acc); err != nil {

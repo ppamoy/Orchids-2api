@@ -167,6 +167,9 @@ func NewFromAccount(acc *store.Account, base *config.Config) *Client {
 		cfg.MaxRetries = base.MaxRetries
 		cfg.RetryDelay = base.RetryDelay
 		cfg.RequestTimeout = base.RequestTimeout
+		cfg.SuppressThinking = base.SuppressThinking
+		cfg.OrchidsMaxToolResults = base.OrchidsMaxToolResults
+		cfg.OrchidsMaxHistoryMessages = base.OrchidsMaxHistoryMessages
 
 		// Copy Proxy Config
 		cfg.ProxyHTTP = base.ProxyHTTP
@@ -192,6 +195,61 @@ func (c *Client) GetToken() (string, error) {
 	}
 	if c.config.UpstreamToken != "" {
 		return c.config.UpstreamToken, nil
+	}
+
+	// Orchids OAuth (AIClient-compatible): if we have __client, prefer fetching
+	// Clerk /v1/client and using sessions[0].last_active_token.jwt.
+	// That token is typically short-lived, so we cache by sessionID using its exp claim.
+	if c.account != nil {
+		if strings.TrimSpace(c.account.ClientCookie) != "" {
+			// If we already have a cached token for this session, use it.
+			if cached, ok := getCachedToken(strings.TrimSpace(c.account.SessionID)); ok {
+				return cached, nil
+			}
+
+			info, err := clerk.FetchAccountInfoWithSession(c.account.ClientCookie, c.account.SessionCookie)
+			if err == nil && info != nil {
+				// Update runtime config (used by some upstream payload fields)
+				c.applyAccountInfo(info)
+				// Persist rotated __client and identity fields back to store account snapshot
+				c.persistAccountInfo(info)
+				if strings.TrimSpace(info.SessionID) != "" {
+					// Ensure config has the latest session id/cookies then fetch a bearer token
+					// via the official Clerk tokens endpoint.
+					c.config.SessionID = strings.TrimSpace(info.SessionID)
+					bearer, tokErr := c.fetchToken()
+					if tokErr == nil && strings.TrimSpace(bearer) != "" {
+						setCachedToken(info.SessionID, bearer)
+						slog.Debug("Orchids token source", "source", "clerk_session_tokens_endpoint", "session_id", info.SessionID, "has_session_cookie", strings.TrimSpace(c.account.SessionCookie) != "")
+						return bearer, nil
+					}
+					if tokErr != nil {
+						slog.Warn("Orchids token fetch: tokens endpoint failed", "session_id", info.SessionID, "error", tokErr)
+					}
+				}
+				// Info returned but missing JWT/sessionID.
+				slog.Warn("Orchids token fetch: clerk info missing jwt/session", "has_jwt", strings.TrimSpace(info.JWT) != "", "session_id", info.SessionID)
+			} else if err != nil {
+				lower := strings.ToLower(err.Error())
+				if strings.Contains(lower, "no active sessions found") {
+					logKey := "clerk_info"
+					if c.account != nil {
+						logKey = fmt.Sprintf("clerk_info:acct:%d", c.account.ID)
+					}
+					if shouldLogNoActiveSession(logKey) {
+						slog.Debug("Orchids token fetch: clerk info failed (no active sessions)", "error", err)
+					}
+				} else {
+					slog.Warn("Orchids token fetch: clerk info failed", "error", err)
+				}
+			}
+			// If Clerk fetch fails, fall back to any stored token below.
+		}
+
+		// Per-account JWT: allow using a pasted bearer token directly.
+		if tok := strings.TrimSpace(c.account.Token); tok != "" {
+			return tok, nil
+		}
 	}
 
 	if c.config.AutoRefreshToken {
@@ -419,13 +477,9 @@ func (c *Client) sendRequestSSE(ctx context.Context, req upstream.UpstreamReques
 		return fmt.Errorf("failed to get token: %w", err)
 	}
 
-	payloadMessages := req.Messages
-	payloadSystem := req.System
-	if cfg != nil && strings.EqualFold(strings.TrimSpace(cfg.OrchidsImpl), "aiclient") {
-		// AIClient 模式：避免 prompt + messages 双份注入上下文
-		payloadMessages = nil
-		payloadSystem = nil
-	}
+	// AIClient-only: avoid prompt + messages double-injection.
+	payloadMessages := []prompt.Message(nil)
+	payloadSystem := []prompt.SystemItem(nil)
 	projectID := ""
 	agentMode := ""
 	email := ""
@@ -435,6 +489,10 @@ func (c *Client) sendRequestSSE(ctx context.Context, req upstream.UpstreamReques
 		agentMode = cfg.AgentMode
 		email = cfg.Email
 		userID = cfg.UserID
+	}
+	payloadTools := compactIncomingTools(req.Tools)
+	if req.NoTools {
+		payloadTools = nil
 	}
 
 	payload := AgentRequest{
@@ -452,7 +510,7 @@ func (c *Client) sendRequestSSE(ctx context.Context, req upstream.UpstreamReques
 		Model:         req.Model,
 		Messages:      payloadMessages,
 		System:        payloadSystem,
-		Tools:         req.Tools,
+		Tools:         payloadTools,
 	}
 	if payload.ChatSessionID == "" {
 		payload.ChatSessionID = fmt.Sprintf("chat_%d", rand.IntN(90000000)+10000000)

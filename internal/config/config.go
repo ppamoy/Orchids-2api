@@ -35,14 +35,6 @@ type Config struct {
 	RedisPassword             string   `json:"redis_password"`
 	RedisDB                   int      `json:"redis_db"`
 	RedisPrefix               string   `json:"redis_prefix"`
-	SummaryCacheMode          string   `json:"summary_cache_mode"`
-	SummaryCacheSize          int      `json:"summary_cache_size"`
-	SummaryCacheTTLSeconds    int      `json:"summary_cache_ttl_seconds"`
-	SummaryCacheLog           bool     `json:"summary_cache_log"`
-	SummaryCacheRedisAddr     string   `json:"summary_cache_redis_addr"`
-	SummaryCacheRedisPass     string   `json:"summary_cache_redis_password"`
-	SummaryCacheRedisDB       int      `json:"summary_cache_redis_db"`
-	SummaryCacheRedisPrefix   string   `json:"summary_cache_redis_prefix"`
 	ContextMaxTokens          int      `json:"context_max_tokens"`
 	ContextSummaryMaxTokens   int      `json:"context_summary_max_tokens"`
 	ContextKeepTurns          int      `json:"context_keep_turns"`
@@ -52,11 +44,18 @@ type Config struct {
 	OrchidsAPIBaseURL         string   `json:"orchids_api_base_url"`
 	OrchidsWSURL              string   `json:"orchids_ws_url"`
 	OrchidsAPIVersion         string   `json:"orchids_api_version"`
-	OrchidsImpl               string   `json:"orchids_impl"`
 	OrchidsAllowRunCommand    bool     `json:"orchids_allow_run_command"`
 	OrchidsRunAllowlist       []string `json:"orchids_run_allowlist"`
 	OrchidsCCEntrypointMode   string   `json:"orchids_cc_entrypoint_mode"`
 	OrchidsFSIgnore           []string `json:"orchids_fs_ignore"`
+	GrokAPIBaseURL            string   `json:"grok_api_base_url"`
+	GrokUserAgent             string   `json:"grok_user_agent"`
+	GrokCFClearance           string   `json:"grok_cf_clearance"`
+	GrokCFBM                  string   `json:"grok_cf_bm"`
+	GrokBaseProxyURL          string   `json:"grok_base_proxy_url"`
+	GrokAssetProxyURL         string   `json:"grok_asset_proxy_url"`
+	GrokUseUTLS               bool     `json:"grok_use_utls"`
+	GrokDebugImageFallback    bool     `json:"grok_debug_image_fallback"`
 	WarpDisableTools          *bool    `json:"warp_disable_tools"`
 	WarpMaxToolResults        int      `json:"warp_max_tool_results"`
 	WarpMaxHistoryMessages    int      `json:"warp_max_history_messages"`
@@ -174,30 +173,7 @@ func ApplyDefaults(cfg *Config) {
 	if cfg.RedisPrefix == "" {
 		cfg.RedisPrefix = "orchids:"
 	}
-	if cfg.SummaryCacheMode == "" {
-		if strings.ToLower(strings.TrimSpace(cfg.StoreMode)) == "redis" {
-			cfg.SummaryCacheMode = "redis"
-		} else {
-			cfg.SummaryCacheMode = "memory"
-		}
-	}
-	if strings.ToLower(strings.TrimSpace(cfg.SummaryCacheMode)) == "redis" {
-		if cfg.SummaryCacheRedisAddr == "" {
-			cfg.SummaryCacheRedisAddr = cfg.RedisAddr
-		}
-		if cfg.SummaryCacheRedisPass == "" {
-			cfg.SummaryCacheRedisPass = cfg.RedisPassword
-		}
-	}
-	if cfg.SummaryCacheSize == 0 {
-		cfg.SummaryCacheSize = 256
-	}
-	if cfg.SummaryCacheTTLSeconds == 0 {
-		cfg.SummaryCacheTTLSeconds = 3600
-	}
-	if cfg.SummaryCacheRedisPrefix == "" {
-		cfg.SummaryCacheRedisPrefix = "orchids:summary:"
-	}
+	// Summary cache removed.
 	if cfg.ContextMaxTokens == 0 {
 		cfg.ContextMaxTokens = 8000
 	}
@@ -216,9 +192,7 @@ func ApplyDefaults(cfg *Config) {
 	if cfg.OrchidsAPIVersion == "" {
 		cfg.OrchidsAPIVersion = "2"
 	}
-	if cfg.OrchidsImpl == "" {
-		cfg.OrchidsImpl = "legacy"
-	}
+	// Orchids: AIClient-only. Legacy orchids_impl is ignored if present.
 	if len(cfg.OrchidsRunAllowlist) == 0 {
 		cfg.OrchidsRunAllowlist = []string{"pwd", "ls", "find"}
 	}
@@ -227,6 +201,12 @@ func ApplyDefaults(cfg *Config) {
 	}
 	if len(cfg.OrchidsFSIgnore) == 0 {
 		cfg.OrchidsFSIgnore = []string{"debug-logs", "data", ".claude"}
+	}
+	if cfg.GrokAPIBaseURL == "" {
+		cfg.GrokAPIBaseURL = "https://grok.com"
+	}
+	if cfg.GrokUserAgent == "" {
+		cfg.GrokUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
 	}
 
 	if cfg.WarpDisableTools == nil {

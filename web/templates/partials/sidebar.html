@@ -5,22 +5,27 @@
   </div>
   <ul class="sidebar-menu">
     <li class="sidebar-item">
-      <a href="#" class="sidebar-link {{if eq .ActiveTab " accounts"}}active{{end}}" onclick="switchTab('accounts')">
+      <a href="#" class="sidebar-link {{if eq .ActiveTab "accounts"}}active{{end}}" onclick="switchTab('accounts')">
         <span>👤</span> 账号管理
       </a>
     </li>
     <li class="sidebar-item">
-      <a href="#" class="sidebar-link {{if eq .ActiveTab " keys"}}active{{end}}" onclick="switchTab('keys')">
+      <a href="#" class="sidebar-link {{if eq .ActiveTab "keys"}}active{{end}}" onclick="switchTab('keys')">
         <span>⚙️</span> 配置管理
       </a>
     </li>
     <li class="sidebar-item">
-      <a href="#" class="sidebar-link {{if eq .ActiveTab " models"}}active{{end}}" onclick="switchTab('models')">
+      <a href="#" class="sidebar-link {{if eq .ActiveTab "models"}}active{{end}}" onclick="switchTab('models')">
         <span>📁</span> 模型管理
       </a>
     </li>
     <li class="sidebar-item">
-      <a href="#" class="sidebar-link {{if eq .ActiveTab " tutorial"}}active{{end}}" onclick="switchTab('tutorial')">
+      <a href="#" class="sidebar-link {{if eq .ActiveTab "grok-tools"}}active{{end}}" onclick="switchTab('grok-tools')">
+        <span>🧠</span> Grok 工具
+      </a>
+    </li>
+    <li class="sidebar-item">
+      <a href="#" class="sidebar-link {{if eq .ActiveTab "tutorial"}}active{{end}}" onclick="switchTab('tutorial')">
         <span>📖</span> 使用教程
       </a>
     </li>
@@ -39,9 +44,6 @@
         <span class="footer-stat-label">异常</span>
         <span class="footer-stat-value abnormal" id="footerAbnormal">{{.Stats.AbnormalAccounts}}</span>
       </div>
-    </div>
-    <div style="font-size: 0.8rem; color: var(--text-muted);">
-      今日用量 <span style="float: right;" id="footerUsageText">0</span>
     </div>
     <button class="btn"
       style="width: 100%; margin-top: 16px; background: rgba(255,255,255,0.04); border: 1px solid var(--border-color); color: white; justify-content: center;"
