@@ -103,6 +103,7 @@ func buildRequestBytes(promptText, model string, messages []prompt.Message, mcpC
 	if err != nil {
 		return nil, err
 	}
+	normalizedModel := normalizeModel(model)
 
 	fullQuery, isNew := buildWarpQuery(userText, history, toolResults, disableWarpTools)
 	if fullQuery == "" {
@@ -120,7 +121,7 @@ func buildRequestBytes(promptText, model string, messages []prompt.Message, mcpC
 	// 注意：在 task_context 中注入 conversationID 会触发 Warp 400
 	// (invalid AIAgentRequest: cannot parse invalid wire-format data)。
 	// 当前保持空 task_context，依赖历史拼接延续上下文。
-	reqBytes, err := buildRequestBytesFromTemplate(fullQuery, isNew, disableWarpTools, workdir)
+	reqBytes, err := buildRequestBytesFromTemplate(fullQuery, normalizedModel, isNew, disableWarpTools, workdir)
 	if err != nil {
 		return nil, err
 	}
@@ -328,10 +329,7 @@ func toolResultDedupKey(result warpToolResult) string {
 
 func shouldDedupToolResultByContent(content string) bool {
 	lower := strings.ToLower(content)
-	if strings.Contains(lower, "eoferror: eof when reading a line") {
-		return true
-	}
-	return false
+	return strings.Contains(lower, "eoferror: eof when reading a line")
 }
 
 func isBenignNoopShellError(lower string) bool {
@@ -490,7 +488,7 @@ func formatWarpHistory(history []warpHistoryMessage) []string {
 	return parts
 }
 
-func buildRequestBytesFromTemplate(userText string, isNew bool, disableWarpTools bool, workdir string) ([]byte, error) {
+func buildRequestBytesFromTemplate(userText, model string, isNew bool, disableWarpTools bool, workdir string) ([]byte, error) {
 	template := append([]byte(nil), realRequestTemplate...)
 
 	newQueryBytes := []byte(userText)
@@ -531,11 +529,95 @@ func buildRequestBytesFromTemplate(userText string, isNew bool, disableWarpTools
 	// 模板开头保留空 task_context: 0a 00
 	result := append([]byte{0x0a, 0x00}, newInputMsg...)
 	result = append(result, rest...)
+	result = patchTemplateModel(result, model)
 
 	if disableWarpTools {
 		result = removeSupportedTools(result)
 	}
 	return result, nil
+}
+
+// patchTemplateModel rewrites the model entry in the static Warp protobuf template.
+// The template currently stores one model slot as:
+// 0a <entry_len> 0a <model_len> <model> 22 <id_len> <identifier>
+// and is wrapped by a settings field:
+// 1a <settings_len> ...
+// We patch model bytes and adjust the two enclosing single-byte lengths.
+func patchTemplateModel(data []byte, model string) []byte {
+	target := strings.TrimSpace(model)
+	if target == "" {
+		target = defaultModel
+	}
+	modelBytes := []byte(target)
+	if len(modelBytes) == 0 || len(modelBytes) > 0x7f {
+		return data
+	}
+
+	idBytes := []byte(identifier)
+	idPos := findBytes(data, idBytes)
+	if idPos < 2 || data[idPos-2] != 0x22 {
+		return data
+	}
+	idLen := int(data[idPos-1])
+	if idLen != len(idBytes) {
+		return data
+	}
+
+	modelTagPos := -1
+	oldModelLen := 0
+	for i := idPos - 3; i >= 0 && i >= idPos-96; i-- {
+		if data[i] != 0x0a || i+1 >= len(data) {
+			continue
+		}
+		l := int(data[i+1])
+		if i+2+l == idPos-2 {
+			modelTagPos = i
+			oldModelLen = l
+			break
+		}
+	}
+	if modelTagPos < 0 {
+		return data
+	}
+
+	entryTagPos := modelTagPos - 2
+	if entryTagPos < 0 || data[entryTagPos] != 0x0a {
+		return data
+	}
+	settingsTagPos := entryTagPos - 2
+	if settingsTagPos < 0 || data[settingsTagPos] != 0x1a {
+		return data
+	}
+
+	oldEntryLen := int(data[entryTagPos+1])
+	expectedEntryLen := idPos + idLen - modelTagPos
+	if oldEntryLen != expectedEntryLen {
+		return data
+	}
+
+	oldSettingsLen := int(data[settingsTagPos+1])
+	delta := len(modelBytes) - oldModelLen
+	newEntryLen := oldEntryLen + delta
+	newSettingsLen := oldSettingsLen + delta
+	if newEntryLen < 0 || newEntryLen > 0x7f || newSettingsLen < 0 || newSettingsLen > 0x7f {
+		return data
+	}
+
+	modelStart := modelTagPos + 2
+	modelEnd := modelStart + oldModelLen
+	if modelEnd > len(data) {
+		return data
+	}
+
+	out := make([]byte, 0, len(data)+delta)
+	out = append(out, data[:modelStart]...)
+	out = append(out, modelBytes...)
+	out = append(out, data[modelEnd:]...)
+
+	out[modelTagPos+1] = byte(len(modelBytes))
+	out[entryTagPos+1] = byte(newEntryLen)
+	out[settingsTagPos+1] = byte(newSettingsLen)
+	return out
 }
 
 func removeSupportedTools(data []byte) []byte {
@@ -693,11 +775,18 @@ type toolDef struct {
 	Schema      map[string]interface{}
 }
 
+const (
+	maxWarpToolCount         = 24
+	maxWarpToolDescLen       = 512
+	maxWarpToolSchemaJSONLen = 4096
+)
+
 func convertTools(tools []interface{}) []toolDef {
 	if len(tools) == 0 {
 		return nil
 	}
 	defs := make([]toolDef, 0, len(tools))
+	seen := make(map[string]struct{})
 	for _, raw := range tools {
 		m, ok := raw.(map[string]interface{})
 		if !ok {
@@ -711,9 +800,20 @@ func convertTools(tools []interface{}) []toolDef {
 				}
 				name = orchids.NormalizeToolName(name)
 				description, _ := fn["description"].(string)
-				schema := schemaMap(fn["parameters"])
+				schema := compactWarpSchema(schemaMap(fn["parameters"]))
 				if name != "" {
-					defs = append(defs, toolDef{Name: name, Description: description, Schema: schema})
+					key := strings.ToLower(strings.TrimSpace(name))
+					if key == "" {
+						continue
+					}
+					if _, exists := seen[key]; exists {
+						continue
+					}
+					seen[key] = struct{}{}
+					defs = append(defs, toolDef{Name: name, Description: compactWarpDescription(description), Schema: schema})
+					if len(defs) >= maxWarpToolCount {
+						break
+					}
 				}
 				continue
 			}
@@ -728,8 +828,20 @@ func convertTools(tools []interface{}) []toolDef {
 		if schema == nil {
 			schema = schemaMap(m["parameters"])
 		}
+		schema = compactWarpSchema(schema)
 		if name != "" {
-			defs = append(defs, toolDef{Name: name, Description: description, Schema: schema})
+			key := strings.ToLower(strings.TrimSpace(name))
+			if key == "" {
+				continue
+			}
+			if _, exists := seen[key]; exists {
+				continue
+			}
+			seen[key] = struct{}{}
+			defs = append(defs, toolDef{Name: name, Description: compactWarpDescription(description), Schema: schema})
+			if len(defs) >= maxWarpToolCount {
+				break
+			}
 		}
 	}
 	return defs
@@ -743,6 +855,117 @@ func schemaMap(v interface{}) map[string]interface{} {
 		return m
 	}
 	return nil
+}
+
+func compactWarpDescription(description string) string {
+	description = strings.TrimSpace(description)
+	if description == "" {
+		return ""
+	}
+	runes := []rune(description)
+	if len(runes) <= maxWarpToolDescLen {
+		return description
+	}
+	return string(runes[:maxWarpToolDescLen]) + "...[truncated]"
+}
+
+func compactWarpSchema(schema map[string]interface{}) map[string]interface{} {
+	if schema == nil {
+		return nil
+	}
+	cleaned := cleanWarpSchema(schema)
+	if cleaned == nil {
+		return nil
+	}
+	if warpSchemaJSONLen(cleaned) <= maxWarpToolSchemaJSONLen {
+		return cleaned
+	}
+	stripped := stripWarpSchemaDescriptions(cleaned)
+	if warpSchemaJSONLen(stripped) <= maxWarpToolSchemaJSONLen {
+		return stripped
+	}
+	return map[string]interface{}{
+		"type":       "object",
+		"properties": map[string]interface{}{},
+	}
+}
+
+func cleanWarpSchema(schema map[string]interface{}) map[string]interface{} {
+	if schema == nil {
+		return nil
+	}
+	sanitized := map[string]interface{}{}
+	for _, key := range []string{"type", "description", "properties", "required", "enum", "items"} {
+		if v, ok := schema[key]; ok {
+			sanitized[key] = v
+		}
+	}
+	if props, ok := sanitized["properties"].(map[string]interface{}); ok {
+		cleanProps := map[string]interface{}{}
+		for name, prop := range props {
+			cleanProps[name] = cleanWarpSchemaValue(prop)
+		}
+		sanitized["properties"] = cleanProps
+	}
+	if items, ok := sanitized["items"]; ok {
+		sanitized["items"] = cleanWarpSchemaValue(items)
+	}
+	return sanitized
+}
+
+func cleanWarpSchemaValue(value interface{}) interface{} {
+	switch v := value.(type) {
+	case map[string]interface{}:
+		return cleanWarpSchema(v)
+	case []interface{}:
+		out := make([]interface{}, 0, len(v))
+		for _, item := range v {
+			out = append(out, cleanWarpSchemaValue(item))
+		}
+		return out
+	default:
+		return value
+	}
+}
+
+func stripWarpSchemaDescriptions(schema map[string]interface{}) map[string]interface{} {
+	if schema == nil {
+		return nil
+	}
+	out := make(map[string]interface{}, len(schema))
+	for k, v := range schema {
+		if strings.EqualFold(k, "description") || strings.EqualFold(k, "title") {
+			continue
+		}
+		out[k] = stripWarpSchemaDescriptionsValue(v)
+	}
+	return out
+}
+
+func stripWarpSchemaDescriptionsValue(value interface{}) interface{} {
+	switch v := value.(type) {
+	case map[string]interface{}:
+		return stripWarpSchemaDescriptions(v)
+	case []interface{}:
+		out := make([]interface{}, 0, len(v))
+		for _, item := range v {
+			out = append(out, stripWarpSchemaDescriptionsValue(item))
+		}
+		return out
+	default:
+		return value
+	}
+}
+
+func warpSchemaJSONLen(schema map[string]interface{}) int {
+	if schema == nil {
+		return 0
+	}
+	raw, err := json.Marshal(schema)
+	if err != nil {
+		return 0
+	}
+	return len(raw)
 }
 
 func normalizeModel(model string) string {

@@ -3,6 +3,8 @@ package config
 import (
 	"bufio"
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,85 +16,88 @@ import (
 )
 
 type Config struct {
-	Port                      string   `json:"port"`
-	DebugEnabled              bool     `json:"debug_enabled"`
-	SessionID                 string   `json:"session_id"`
-	ClientCookie              string   `json:"client_cookie"`
-	SessionCookie             string   `json:"session_cookie"`
-	ClientUat                 string   `json:"client_uat"`
-	ProjectID                 string   `json:"project_id"`
-	UserID                    string   `json:"user_id"`
-	AgentMode                 string   `json:"agent_mode"`
-	Email                     string   `json:"email"`
-	AdminUser                 string   `json:"admin_user"`
-	AdminPass                 string   `json:"admin_pass"`
-	AdminPath                 string   `json:"admin_path"`
-	DebugLogSSE               bool     `json:"debug_log_sse"`
-	SuppressThinking          bool     `json:"suppress_thinking"`
-	OutputTokenMode           string   `json:"output_token_mode"`
-	StoreMode                 string   `json:"store_mode"`
-	RedisAddr                 string   `json:"redis_addr"`
-	RedisPassword             string   `json:"redis_password"`
-	RedisDB                   int      `json:"redis_db"`
-	RedisPrefix               string   `json:"redis_prefix"`
-	SummaryCacheMode          string   `json:"summary_cache_mode"`
-	SummaryCacheSize          int      `json:"summary_cache_size"`
-	SummaryCacheTTLSeconds    int      `json:"summary_cache_ttl_seconds"`
-	SummaryCacheLog           bool     `json:"summary_cache_log"`
-	SummaryCacheRedisAddr     string   `json:"summary_cache_redis_addr"`
-	SummaryCacheRedisPass     string   `json:"summary_cache_redis_password"`
-	SummaryCacheRedisDB       int      `json:"summary_cache_redis_db"`
-	SummaryCacheRedisPrefix   string   `json:"summary_cache_redis_prefix"`
-	ContextMaxTokens          int      `json:"context_max_tokens"`
-	ContextSummaryMaxTokens   int      `json:"context_summary_max_tokens"`
-	ContextKeepTurns          int      `json:"context_keep_turns"`
-	UpstreamURL               string   `json:"upstream_url"`
-	UpstreamToken             string   `json:"upstream_token"`
-	UpstreamMode              string   `json:"upstream_mode"`
-	OrchidsAPIBaseURL         string   `json:"orchids_api_base_url"`
-	OrchidsWSURL              string   `json:"orchids_ws_url"`
-	OrchidsAPIVersion         string   `json:"orchids_api_version"`
-	OrchidsImpl               string   `json:"orchids_impl"`
-	OrchidsAllowRunCommand    bool     `json:"orchids_allow_run_command"`
-	OrchidsRunAllowlist       []string `json:"orchids_run_allowlist"`
-	OrchidsCCEntrypointMode   string   `json:"orchids_cc_entrypoint_mode"`
-	OrchidsFSIgnore           []string `json:"orchids_fs_ignore"`
-	WarpDisableTools          *bool    `json:"warp_disable_tools"`
-	WarpMaxToolResults        int      `json:"warp_max_tool_results"`
-	WarpMaxHistoryMessages    int      `json:"warp_max_history_messages"`
-	WarpSplitToolResults      bool     `json:"warp_split_tool_results"`
-	OrchidsMaxToolResults     int      `json:"orchids_max_tool_results"`
-	OrchidsMaxHistoryMessages int      `json:"orchids_max_history_messages"`
+	// ── Configurable fields (read from config.json / Redis) ──
+	Port          string `json:"port"`
+	DebugEnabled  bool   `json:"debug_enabled"`
+	AdminUser     string `json:"admin_user"`
+	AdminPass     string `json:"admin_pass"`
+	AdminPath     string `json:"admin_path"`
+	AdminToken    string `json:"admin_token"`
+	StoreMode     string `json:"store_mode"`
+	RedisAddr     string `json:"redis_addr"`
+	RedisPassword string `json:"redis_password"`
+	RedisDB       int    `json:"redis_db"`
+	RedisPrefix   string `json:"redis_prefix"`
+	CacheTokenCount bool   `json:"cache_token_count"`
+	CacheTTL        int    `json:"cache_ttl"`
+	CacheStrategy   string `json:"cache_strategy"`
 
-	// New fields for UI
-	AdminToken           string `json:"admin_token"`
-	MaxRetries           int    `json:"max_retries"`
-	RetryDelay           int    `json:"retry_delay"`
-	AccountSwitchCount   int    `json:"account_switch_count"`
-	RequestTimeout       int    `json:"request_timeout"`
-	Retry429Interval     int    `json:"retry_429_interval"`
-	TokenRefreshInterval int    `json:"token_refresh_interval"`
-	AutoRefreshToken     bool   `json:"auto_refresh_token"`
-	OutputTokenCount     bool   `json:"output_token_count"`
-	CacheTokenCount      bool   `json:"cache_token_count"`
-	CacheTTL             int    `json:"cache_ttl"`
-	CacheStrategy        string `json:"cache_strategy"`
-	LoadBalancerCacheTTL int    `json:"load_balancer_cache_ttl"`
-	ConcurrencyLimit     int    `json:"concurrency_limit"`
-	ConcurrencyTimeout   int    `json:"concurrency_timeout"`
-	AdaptiveTimeout      bool   `json:"adaptive_timeout"`
+	// ── Per-client state (used by orchids client, not configurable) ──
+	SessionID     string `json:"-"`
+	ClientCookie  string `json:"-"`
+	SessionCookie string `json:"-"`
+	ClientUat     string `json:"-"`
+	ProjectID     string `json:"-"`
+	UserID        string `json:"-"`
+	AgentMode     string `json:"-"`
+	Email         string `json:"-"`
 
-	// Proxy Configuration
-	ProxyHTTP   string   `json:"proxy_http"`
-	ProxyHTTPS  string   `json:"proxy_https"`
-	ProxyUser   string   `json:"proxy_user"`
-	ProxyPass   string   `json:"proxy_pass"`
-	ProxyBypass []string `json:"proxy_bypass"`
-
-	// Auto Registration
-	AutoRegEnabled   bool   `json:"auto_reg_enabled"`
-	AutoRegThreshold int    `json:"auto_reg_threshold"`
-	AutoRegScript    string `json:"auto_reg_script"`
+	// ── Hardcoded fields (set unconditionally by ApplyHardcoded) ──
+	DebugLogSSE               bool     `json:"-"`
+	SuppressThinking          bool     `json:"-"`
+	OutputTokenMode           string   `json:"-"`
+	ContextMaxTokens          int      `json:"-"`
+	ContextSummaryMaxTokens   int      `json:"-"`
+	ContextKeepTurns          int      `json:"-"`
+	UpstreamURL               string   `json:"-"`
+	UpstreamToken             string   `json:"-"`
+	UpstreamMode              string   `json:"-"`
+	OrchidsAPIBaseURL         string   `json:"-"`
+	OrchidsWSURL              string   `json:"-"`
+	OrchidsAPIVersion         string   `json:"-"`
+	OrchidsAllowRunCommand    bool     `json:"-"`
+	OrchidsRunAllowlist       []string `json:"-"`
+	OrchidsCCEntrypointMode   string   `json:"-"`
+	OrchidsFSIgnore           []string `json:"-"`
+	GrokAPIBaseURL            string   `json:"-"`
+	GrokUserAgent             string   `json:"-"`
+	GrokCFClearance           string   `json:"-"`
+	GrokCFBM                  string   `json:"-"`
+	GrokBaseProxyURL          string   `json:"-"`
+	GrokAssetProxyURL         string   `json:"-"`
+	GrokUseUTLS               bool     `json:"-"`
+	WarpDisableTools          *bool    `json:"-"`
+	WarpMaxToolResults        int      `json:"-"`
+	WarpMaxHistoryMessages    int      `json:"-"`
+	WarpSplitToolResults      bool     `json:"-"`
+	OrchidsMaxToolResults     int      `json:"-"`
+	OrchidsMaxHistoryMessages int      `json:"-"`
+	Stream                    *bool    `json:"-"`
+	ImageNSFW                 *bool    `json:"-"`
+	ImageFinalMinBytes        int      `json:"-"`
+	ImageMediumMinBytes       int      `json:"-"`
+	MaxRetries                int      `json:"-"`
+	RetryDelay                int      `json:"-"`
+	AccountSwitchCount        int      `json:"-"`
+	RequestTimeout            int      `json:"-"`
+	Retry429Interval          int      `json:"-"`
+	TokenRefreshInterval      int      `json:"-"`
+	AutoRefreshToken          bool     `json:"-"`
+	OutputTokenCount          bool     `json:"-"`
+	LoadBalancerCacheTTL      int      `json:"-"`
+	ConcurrencyLimit          int      `json:"-"`
+	ConcurrencyTimeout        int      `json:"-"`
+	AdaptiveTimeout           bool     `json:"-"`
+	ProxyHTTP                 string   `json:"proxy_http"`
+	ProxyHTTPS                string   `json:"proxy_https"`
+	ProxyUser                 string   `json:"proxy_user"`
+	ProxyPass                 string   `json:"proxy_pass"`
+	ProxyBypass               []string `json:"proxy_bypass"`
+	AutoRegEnabled            bool     `json:"-"`
+	AutoRegThreshold          int      `json:"-"`
+	AutoRegScript             string   `json:"-"`
+	PublicKey                 string   `json:"-"`
+	PublicEnabled             *bool    `json:"-"`
 }
 
 func Load(path string) (*Config, string, error) {
@@ -156,17 +161,17 @@ func ApplyDefaults(cfg *Config) {
 		cfg.AdminUser = "admin"
 	}
 	if cfg.AdminPass == "" {
-		cfg.AdminPass = "admin123"
-		slog.Warn("使用默认管理员密码 admin123，请在配置文件中设置 admin_pass")
+		generated, err := generateRandomPassword(16)
+		if err != nil {
+			slog.Error("无法生成随机密码", "error", err)
+			os.Exit(1)
+		}
+		cfg.AdminPass = generated
+		slog.Warn("未设置 admin_pass，已自动生成随机密码，请在配置文件中设置 admin_pass",
+			"generated_password", generated)
 	}
 	if cfg.AdminPath == "" {
 		cfg.AdminPath = "/admin"
-	}
-	if cfg.OutputTokenMode == "" {
-		cfg.OutputTokenMode = "final"
-	}
-	if cfg.UpstreamMode == "" {
-		cfg.UpstreamMode = "sse"
 	}
 	if cfg.StoreMode == "" {
 		cfg.StoreMode = "redis"
@@ -174,127 +179,101 @@ func ApplyDefaults(cfg *Config) {
 	if cfg.RedisPrefix == "" {
 		cfg.RedisPrefix = "orchids:"
 	}
-	if cfg.SummaryCacheMode == "" {
-		if strings.ToLower(strings.TrimSpace(cfg.StoreMode)) == "redis" {
-			cfg.SummaryCacheMode = "redis"
-		} else {
-			cfg.SummaryCacheMode = "memory"
-		}
-	}
-	if strings.ToLower(strings.TrimSpace(cfg.SummaryCacheMode)) == "redis" {
-		if cfg.SummaryCacheRedisAddr == "" {
-			cfg.SummaryCacheRedisAddr = cfg.RedisAddr
-		}
-		if cfg.SummaryCacheRedisPass == "" {
-			cfg.SummaryCacheRedisPass = cfg.RedisPassword
-		}
-	}
-	if cfg.SummaryCacheSize == 0 {
-		cfg.SummaryCacheSize = 256
-	}
-	if cfg.SummaryCacheTTLSeconds == 0 {
-		cfg.SummaryCacheTTLSeconds = 3600
-	}
-	if cfg.SummaryCacheRedisPrefix == "" {
-		cfg.SummaryCacheRedisPrefix = "orchids:summary:"
-	}
-	if cfg.ContextMaxTokens == 0 {
-		cfg.ContextMaxTokens = 8000
-	}
-	if cfg.ContextSummaryMaxTokens == 0 {
-		cfg.ContextSummaryMaxTokens = 800
-	}
-	if cfg.ContextKeepTurns == 0 {
-		cfg.ContextKeepTurns = 6
-	}
-	if cfg.OrchidsAPIBaseURL == "" {
-		cfg.OrchidsAPIBaseURL = "https://orchids-server.calmstone-6964e08a.westeurope.azurecontainerapps.io"
-	}
-	if cfg.OrchidsWSURL == "" {
-		cfg.OrchidsWSURL = "wss://orchids-v2-alpha-108292236521.europe-west1.run.app/agent/ws/coding-agent"
-	}
-	if cfg.OrchidsAPIVersion == "" {
-		cfg.OrchidsAPIVersion = "2"
-	}
-	if cfg.OrchidsImpl == "" {
-		cfg.OrchidsImpl = "legacy"
-	}
-	if len(cfg.OrchidsRunAllowlist) == 0 {
-		cfg.OrchidsRunAllowlist = []string{"pwd", "ls", "find"}
-	}
-	if cfg.OrchidsCCEntrypointMode == "" {
-		cfg.OrchidsCCEntrypointMode = "auto"
-	}
-	if len(cfg.OrchidsFSIgnore) == 0 {
-		cfg.OrchidsFSIgnore = []string{"debug-logs", "data", ".claude"}
-	}
-
-	if cfg.WarpDisableTools == nil {
-		v := false
-		cfg.WarpDisableTools = &v
-	}
-	if cfg.WarpMaxToolResults == 0 {
-		cfg.WarpMaxToolResults = 10
-	}
-	if cfg.WarpMaxHistoryMessages == 0 {
-		cfg.WarpMaxHistoryMessages = 20
-	}
-	if cfg.OrchidsMaxToolResults == 0 {
-		cfg.OrchidsMaxToolResults = 10
-	}
-	if cfg.OrchidsMaxHistoryMessages == 0 {
-		cfg.OrchidsMaxHistoryMessages = 20
-	}
-
-	// New defaults
-	if cfg.MaxRetries == 0 {
-		cfg.MaxRetries = 3
-	}
-	if cfg.RetryDelay == 0 {
-		cfg.RetryDelay = 1000
-	}
-	if cfg.AccountSwitchCount == 0 {
-		cfg.AccountSwitchCount = 5
-	}
-	if cfg.RequestTimeout == 0 {
-		cfg.RequestTimeout = 600
-	}
-	if cfg.Retry429Interval == 0 {
-		cfg.Retry429Interval = 60
-	}
-	if cfg.TokenRefreshInterval == 0 {
-		cfg.TokenRefreshInterval = 1
-	}
-	if cfg.CacheTTL == 0 {
+	if cfg.CacheTTL <= 0 {
 		cfg.CacheTTL = 5
 	}
-	if cfg.CacheStrategy == "" {
-		cfg.CacheStrategy = "mixed"
+	if strings.TrimSpace(cfg.CacheStrategy) == "" {
+		cfg.CacheStrategy = "mix"
 	}
-	if cfg.LoadBalancerCacheTTL == 0 {
-		cfg.LoadBalancerCacheTTL = 5
-	}
-	if cfg.ConcurrencyLimit == 0 {
-		cfg.ConcurrencyLimit = 100
-	}
-	if cfg.ConcurrencyTimeout == 0 {
-		cfg.ConcurrencyTimeout = 300
-	}
-
-	// Auto Reg defaults
-	if cfg.AutoRegThreshold == 0 {
-		cfg.AutoRegThreshold = 5
-	}
-	if cfg.AutoRegScript == "" {
-		cfg.AutoRegScript = "scripts/autoreg.py"
-	}
+	// Always apply hardcoded values
+	ApplyHardcoded(cfg)
 }
 
-func (c *Config) GetCookies() string {
-	if strings.TrimSpace(c.SessionCookie) != "" {
-		return "__client=" + c.ClientCookie + "; __session=" + c.SessionCookie
+// ApplyHardcoded unconditionally sets all non-configurable fields to their
+// fixed values. Call this after any JSON decode (config file, Redis, API)
+// to ensure these values cannot be overridden.
+func ApplyHardcoded(cfg *Config) {
+	cfg.OutputTokenMode = "final"
+	cfg.UpstreamMode = "sse"
+	cfg.ContextMaxTokens = 100000
+	cfg.ContextSummaryMaxTokens = 800
+	cfg.ContextKeepTurns = 6
+	cfg.OrchidsAPIBaseURL = "https://orchids-server.calmstone-6964e08a.westeurope.azurecontainerapps.io"
+	cfg.OrchidsWSURL = "wss://orchids-v2-alpha-108292236521.europe-west1.run.app/agent/ws/coding-agent"
+	cfg.OrchidsAPIVersion = "2"
+	cfg.OrchidsAllowRunCommand = true
+	cfg.OrchidsRunAllowlist = []string{"*"}
+	cfg.OrchidsCCEntrypointMode = "auto"
+	cfg.OrchidsFSIgnore = []string{"debug-logs", "data", ".claude"}
+	cfg.GrokAPIBaseURL = "https://grok.com"
+	cfg.GrokUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
+	v := false
+	cfg.WarpDisableTools = &v
+	cfg.WarpMaxToolResults = 10
+	cfg.WarpMaxHistoryMessages = 20
+	cfg.OrchidsMaxToolResults = 10
+	cfg.OrchidsMaxHistoryMessages = 20
+	vTrue := true
+	cfg.Stream = &vTrue
+	cfg.ImageNSFW = &vTrue
+	cfg.ImageFinalMinBytes = 100000
+	cfg.ImageMediumMinBytes = 30000
+	cfg.MaxRetries = 3
+	cfg.RetryDelay = 1000
+	cfg.AccountSwitchCount = 5
+	cfg.RequestTimeout = 600
+	cfg.Retry429Interval = 60
+	cfg.TokenRefreshInterval = 1
+	cfg.AutoRefreshToken = true
+	cfg.LoadBalancerCacheTTL = 5
+	cfg.ConcurrencyLimit = 100
+	cfg.ConcurrencyTimeout = 300
+	cfg.AdaptiveTimeout = true
+	cfg.AutoRegThreshold = 5
+	cfg.AutoRegScript = "scripts/autoreg.py"
+	cfg.DebugLogSSE = true
+}
+
+func (c *Config) ChatDefaultStream() bool {
+	if c == nil || c.Stream == nil {
+		return true
 	}
-	return "__client=" + c.ClientCookie + "; __client_uat=" + c.ClientUat
+	return *c.Stream
+}
+
+func (c *Config) PublicImagineNSFW() bool {
+	if c == nil || c.ImageNSFW == nil {
+		return true
+	}
+	return *c.ImageNSFW
+}
+
+func (c *Config) PublicImagineFinalMinBytes() int {
+	if c == nil || c.ImageFinalMinBytes <= 0 {
+		return 100000
+	}
+	return c.ImageFinalMinBytes
+}
+
+func (c *Config) PublicImagineMediumMinBytes() int {
+	if c == nil || c.ImageMediumMinBytes <= 0 {
+		return 30000
+	}
+	return c.ImageMediumMinBytes
+}
+
+func (c *Config) PublicAPIKey() string {
+	if c == nil {
+		return ""
+	}
+	return strings.TrimSpace(c.PublicKey)
+}
+
+func (c *Config) PublicAPIEnabled() bool {
+	if c == nil || c.PublicEnabled == nil {
+		return false
+	}
+	return *c.PublicEnabled
 }
 
 func (c *Config) Save(path string) error {
@@ -303,6 +282,14 @@ func (c *Config) Save(path string) error {
 		return err
 	}
 	return os.WriteFile(path, data, 0644)
+}
+
+func generateRandomPassword(length int) (string, error) {
+	b := make([]byte, length)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b)[:length], nil
 }
 
 func parseYAMLFlat(data []byte) (map[string]interface{}, error) {

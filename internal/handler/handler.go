@@ -13,41 +13,36 @@ import (
 	"net/http"
 	rtdebug "runtime/debug"
 	"strings"
-	"sync"
 	"time"
 
 	"orchids-api/internal/adapter"
+	"orchids-api/internal/audit"
 	"orchids-api/internal/config"
 	"orchids-api/internal/debug"
 	"orchids-api/internal/loadbalancer"
 	"orchids-api/internal/orchids"
 	"orchids-api/internal/prompt"
 	"orchids-api/internal/store"
-	"orchids-api/internal/summarycache"
 	"orchids-api/internal/tokencache"
 	"orchids-api/internal/upstream"
 	"orchids-api/internal/util"
 	"orchids-api/internal/warp"
 )
 
+// ClientFactory creates an UpstreamClient for a given account.
+// Used to decouple provider-specific client construction from the handler.
+type ClientFactory func(acc *store.Account, cfg *config.Config) UpstreamClient
+
 type Handler struct {
-	config       *config.Config
-	client       UpstreamClient
-	loadBalancer *loadbalancer.LoadBalancer
-	summaryCache prompt.SummaryCache
-	summaryStats *summarycache.Stats
-	summaryLog   bool
-	tokenCache   tokencache.Cache
+	config        *config.Config
+	client        UpstreamClient
+	clientFactory ClientFactory
+	loadBalancer  *loadbalancer.LoadBalancer
+	tokenCache    tokencache.Cache
+	auditLogger   audit.Logger
 
-	sessionWorkdirsMu sync.RWMutex
-	sessionWorkdirs   map[string]string    // Map conversationKey -> string (workdir)
-	sessionConvIDs    map[string]string    // Map conversationKey -> upstream warp conversationID
-	sessionLastAccess map[string]time.Time // Map conversationKey -> last access time
-	sessionCleanupRun time.Time
-
-	recentReqMu      sync.Mutex
-	recentRequests   map[string]*recentRequest
-	recentCleanupRun time.Time
+	sessionStore SessionStore
+	dedupStore   DedupStore
 }
 
 type UpstreamClient interface {
@@ -86,30 +81,41 @@ type recentRequest struct {
 
 func NewWithLoadBalancer(cfg *config.Config, lb *loadbalancer.LoadBalancer) *Handler {
 	h := &Handler{
-		config:            cfg,
-		loadBalancer:      lb,
-		sessionWorkdirs:   make(map[string]string),
-		sessionConvIDs:    make(map[string]string),
-		sessionLastAccess: make(map[string]time.Time),
-		recentRequests:    make(map[string]*recentRequest),
+		config:       cfg,
+		loadBalancer: lb,
+		sessionStore: NewMemorySessionStore(30*time.Minute, 1024),
+		dedupStore:   NewMemoryDedupStore(duplicateWindow, duplicateCleanupWindow),
+		auditLogger:  audit.NewNopLogger(),
 	}
 	if cfg != nil {
-		h.summaryLog = cfg.SummaryCacheLog
 		h.client = orchids.New(cfg)
 	}
+
 	return h
-}
-
-func (h *Handler) SetSummaryCache(cache prompt.SummaryCache) {
-	h.summaryCache = cache
-}
-
-func (h *Handler) SetSummaryStats(stats *summarycache.Stats) {
-	h.summaryStats = stats
 }
 
 func (h *Handler) SetTokenCache(cache tokencache.Cache) {
 	h.tokenCache = cache
+}
+
+// SetSessionStore replaces the default in-memory session store.
+func (h *Handler) SetSessionStore(ss SessionStore) {
+	h.sessionStore = ss
+}
+
+// SetDedupStore replaces the default in-memory dedup store.
+func (h *Handler) SetDedupStore(ds DedupStore) {
+	h.dedupStore = ds
+}
+
+// SetAuditLogger replaces the default nop audit logger.
+func (h *Handler) SetAuditLogger(al audit.Logger) {
+	h.auditLogger = al
+}
+
+// SetClientFactory sets the factory used by selectAccount to create provider-specific clients.
+func (h *Handler) SetClientFactory(f ClientFactory) {
+	h.clientFactory = f
 }
 
 func (h *Handler) writeErrorResponse(w http.ResponseWriter, errType string, message string, code int) {
@@ -137,51 +143,11 @@ func (h *Handler) computeRequestHash(r *http.Request, body []byte) string {
 }
 
 func (h *Handler) registerRequest(hash string) (bool, bool) {
-	now := time.Now()
-	h.recentReqMu.Lock()
-	defer h.recentReqMu.Unlock()
-	if h.recentRequests == nil {
-		h.recentRequests = make(map[string]*recentRequest)
-	}
-	if rec, ok := h.recentRequests[hash]; ok {
-		if now.Sub(rec.last) <= duplicateWindow {
-			return true, rec.inFlight > 0
-		}
-		rec.last = now
-		rec.inFlight++
-		h.cleanupRecentLocked(now)
-		return false, false
-	}
-	h.recentRequests[hash] = &recentRequest{last: now, inFlight: 1}
-	h.cleanupRecentLocked(now)
-	return false, false
+	return h.dedupStore.Register(context.Background(), hash)
 }
 
 func (h *Handler) finishRequest(hash string) {
-	now := time.Now()
-	h.recentReqMu.Lock()
-	defer h.recentReqMu.Unlock()
-	rec, ok := h.recentRequests[hash]
-	if !ok {
-		return
-	}
-	if rec.inFlight > 0 {
-		rec.inFlight--
-	}
-	rec.last = now
-	h.cleanupRecentLocked(now)
-}
-
-func (h *Handler) cleanupRecentLocked(now time.Time) {
-	if len(h.recentRequests) < 256 && now.Sub(h.recentCleanupRun) < duplicateCleanupWindow {
-		return
-	}
-	for k, rec := range h.recentRequests {
-		if rec.inFlight == 0 && now.Sub(rec.last) > duplicateCleanupWindow {
-			delete(h.recentRequests, k)
-		}
-	}
-	h.recentCleanupRun = now
+	h.dedupStore.Finish(context.Background(), hash)
 }
 
 func (h *Handler) writeDuplicateResponse(w http.ResponseWriter, req ClaudeRequest) {
@@ -329,16 +295,17 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	conversationKey := conversationKeyForRequest(r, req)
 
 	forcedChannel := channelFromPath(r.URL.Path)
+	if err := h.validateModelAvailability(r.Context(), req.Model, forcedChannel); err != nil {
+		h.writeErrorResponse(w, "invalid_request_error", err.Error(), http.StatusBadRequest)
+		return
+	}
 	effectiveWorkdir, prevWorkdir, workdirChanged := h.resolveWorkdir(r, req, conversationKey)
 	if workdirChanged {
 		slog.Warn("检测到工作目录变化，已清空历史", "prev", prevWorkdir, "next", effectiveWorkdir, "session", conversationKey)
 		req.Messages = resetMessagesForNewWorkdir(req.Messages)
 		// 工作目录变化时清除上游会话ID，强制开启新对话
 		if conversationKey != "" {
-			h.sessionWorkdirsMu.Lock()
-			delete(h.sessionConvIDs, conversationKey)
-			delete(h.sessionLastAccess, conversationKey)
-			h.sessionWorkdirsMu.Unlock()
+			h.sessionStore.DeleteSession(r.Context(), conversationKey)
 		}
 	}
 
@@ -374,11 +341,8 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		// Warp passthrough mode: do not trim history/tool results.
 		slog.Debug("Checkpoint: warp passthrough, skip trim/sanitize")
 	} else {
-		// Orchids: Compress HUGE tool results (>100KB) to prevent upstream 413/Timeout
-		// 100KB limit is generous enough for most code but prevents MB-sized payloads.
-		slog.Debug("Checkpoint: compressing tool results")
-		compressed, _ := compressToolResults(req.Messages, 102400, "orchids")
-		req.Messages = compressed
+		// Orchids: do not trim message/tool_result content to preserve full context.
+		slog.Debug("Checkpoint: orchids passthrough, skip context trimming")
 		if sanitized, changed := sanitizeSystemItems(req.System, false, h.config); changed {
 			req.System = sanitized
 			slog.Info("系统提示已移除 cc_entrypoint", "mode", h.config.OrchidsCCEntrypointMode, "warp", false)
@@ -397,11 +361,6 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			h.loadBalancer.ReleaseConnection(trackedAccountID)
 		}
 	}()
-
-	var hitsBefore, missesBefore uint64
-	if h.summaryStats != nil && h.summaryLog {
-		hitsBefore, missesBefore = h.summaryStats.Snapshot()
-	}
 
 	suggestionMode := isSuggestionMode(req.Messages)
 	noThinking := suggestionMode || h.config.SuppressThinking
@@ -426,55 +385,27 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	if strings.TrimSpace(effectiveWorkdir) != "" {
 		summaryKey = conversationKey + "|" + strings.TrimSpace(effectiveWorkdir)
 	}
-	opts := prompt.PromptOptions{
-		Context:          r.Context(),
-		ConversationID:   summaryKey,
-		MaxTokens:        h.config.ContextMaxTokens,
-		SummaryMaxTokens: h.config.ContextSummaryMaxTokens,
-		KeepTurns:        h.config.ContextKeepTurns,
-		SummaryCache:     h.summaryCache,
-		ProjectRoot:      effectiveWorkdir,
-	}
+	// NOTE: AIClient mode handles its own context budgeting; legacy PromptOptions are deprecated.
+	_ = summaryKey
+	_ = effectiveWorkdir
 
 	slog.Debug("Starting prompt build...", "conversation_id", conversationKey)
+	// Orchids: always use AIClient mode (other implementations are deprecated/removed).
 	isOrchidsAIClient := false
-	if _, ok := apiClient.(*orchids.Client); ok && strings.EqualFold(strings.TrimSpace(h.config.OrchidsImpl), "aiclient") {
+	if _, ok := apiClient.(*orchids.Client); ok {
 		isOrchidsAIClient = true
 	}
 
 	var aiClientHistory []map[string]string
 	var builtPrompt string
-	if isOrchidsAIClient {
-		builtPrompt, aiClientHistory = orchids.BuildAIClientPromptAndHistory(req.Messages, req.System, req.Model, noThinking, effectiveWorkdir)
-	} else {
-		builtPrompt = prompt.BuildPromptV2WithOptions(prompt.ClaudeAPIRequest{
-			Model:    req.Model,
-			Messages: req.Messages,
-			System:   req.System,
-			Tools:    effectiveTools,
-			Stream:   req.Stream,
-		}, opts)
-	}
+	var promptMeta orchids.AIClientPromptMeta
+	builtPrompt, aiClientHistory, promptMeta = orchids.BuildAIClientPromptAndHistoryWithMeta(req.Messages, req.System, req.Model, noThinking, effectiveWorkdir, h.config.ContextMaxTokens)
 	buildDuration := time.Since(startBuild)
 	slog.Debug("Prompt build completed", "duration", buildDuration)
 	if h.config.DebugEnabled {
-		buildLabel := "BuildPromptV2WithOptions"
-		if isOrchidsAIClient {
-			buildLabel = "BuildAIClientPromptAndHistory"
-		}
+		buildLabel := "BuildAIClientPromptAndHistory"
 		slog.Info("[Performance] "+buildLabel, "duration", buildDuration)
-		if opts.ProjectContext != "" {
-			slog.Debug("Project context injected", "context", opts.ProjectContext)
-		}
-	}
-
-	if h.summaryStats != nil && h.summaryLog {
-		hitsAfter, missesAfter := h.summaryStats.Snapshot()
-		hitDelta := hitsAfter - hitsBefore
-		missDelta := missesAfter - missesBefore
-		if hitDelta > 0 || missDelta > 0 {
-			slog.Debug("summary_cache", "hit", hitDelta, "miss", missDelta)
-		}
+		// Project context injection is deprecated (non-AIClient path removed).
 	}
 
 	// 映射模型
@@ -525,8 +456,22 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	slog.Debug("Checkpoint: LogConvertedPrompt")
 	logger.LogConvertedPrompt(builtPrompt)
 
-	// Token 计数
-	inputTokens := h.estimateInputTokens(r.Context(), req.Model, builtPrompt)
+	breakdown := estimateInputTokenBreakdown(builtPrompt, aiClientHistory, effectiveTools)
+	slog.Info(
+		"Input token breakdown (estimated)",
+		"prompt_profile", promptMeta.Profile,
+		"base_prompt_tokens", breakdown.BasePromptTokens,
+		"system_context_tokens", breakdown.SystemContextTokens,
+		"history_tokens", breakdown.HistoryTokens,
+		"tools_tokens", breakdown.ToolsTokens,
+		"estimated_total_input_tokens", breakdown.Total,
+	)
+
+	// Token 计数（用于前置 usage 展示）
+	inputTokens := breakdown.Total
+	if inputTokens <= 0 {
+		inputTokens = h.estimateInputTokens(r.Context(), req.Model, builtPrompt)
+	}
 
 	// Detect Response Format (Anthropic vs OpenAI)
 	responseFormat := adapter.DetectResponseFormat(r.URL.Path)
@@ -541,11 +486,8 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		if conversationKey == "" {
 			return
 		}
-		h.sessionWorkdirsMu.Lock()
-		h.sessionConvIDs[conversationKey] = id
-		h.sessionLastAccess[conversationKey] = time.Now()
-		h.cleanupSessionWorkdirsLocked()
-		h.sessionWorkdirsMu.Unlock()
+		h.sessionStore.SetConvID(r.Context(), conversationKey, id)
+		h.sessionStore.Touch(r.Context(), conversationKey)
 		slog.Debug("Warp conversationID captured", "key", conversationKey, "id", id)
 	}
 	defer sh.release()
@@ -598,11 +540,8 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		// 复用上游返回的 conversationID，保持会话连续性
 		chatSessionID := ""
 		if conversationKey != "" {
-			h.sessionWorkdirsMu.Lock()
-			chatSessionID = h.sessionConvIDs[conversationKey]
-			h.sessionLastAccess[conversationKey] = time.Now()
-			h.cleanupSessionWorkdirsLocked()
-			h.sessionWorkdirsMu.Unlock()
+			chatSessionID, _ = h.sessionStore.GetConvID(r.Context(), conversationKey)
+			h.sessionStore.Touch(r.Context(), conversationKey)
 		}
 		if chatSessionID == "" {
 			chatSessionID = "chat_" + randomSessionID()
@@ -642,13 +581,39 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			if sender, ok := apiClient.(UpstreamPayloadClient); ok {
 				slog.Info("Using SendRequestWithPayload")
 				warpBatches := [][]prompt.Message{upstreamMessages}
-				if isWarpRequest && h.config.WarpSplitToolResults {
+				if isWarpRequest {
+					// Enforce hard token budget for Warp requests to avoid runaway context cost.
 					if _, isWarp := apiClient.(*warp.Client); isWarp {
-						batches, total := splitWarpToolResults(upstreamMessages, 1)
-						if len(batches) > 1 {
-							slog.Info("Warp 工具结果分批发送", "total_tool_results", total, "batches", len(batches))
+						budget := h.config.ContextMaxTokens
+						if budget <= 0 || budget > 12000 {
+							budget = 12000
 						}
-						warpBatches = batches
+						trimmed, before, after, compressed, summarized, dropped := enforceWarpBudget(builtPrompt, upstreamMessages, budget)
+						if before.Total != after.Total || compressed > 0 || summarized > 0 || dropped > 0 {
+							slog.Info(
+								"Warp budget applied",
+								"budget", budget,
+								"tokens_before", before.Total,
+								"tokens_after", after.Total,
+								"prompt_tokens", after.PromptTokens,
+								"messages_tokens", after.MessagesTokens,
+								"tool_tokens", after.ToolTokens,
+								"compressed_blocks", compressed,
+								"summarized_messages", summarized,
+								"dropped_messages", dropped,
+							)
+						}
+						upstreamMessages = trimmed
+					}
+
+					if h.config.WarpSplitToolResults {
+						if _, isWarp := apiClient.(*warp.Client); isWarp {
+							batches, total := splitWarpToolResults(upstreamMessages, 1)
+							if len(batches) > 1 {
+								slog.Info("Warp 工具结果分批发送", "total_tool_results", total, "batches", len(batches))
+							}
+							warpBatches = batches
+						}
 					}
 				}
 				noopHandler := func(msg upstream.SSEMessage) {
@@ -679,27 +644,32 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 				sh.forceFinishIfMissing()
 				break
 			}
+			if sh.hasAnyOutput() {
+				slog.Warn("Upstream failed after partial output, skip retry to avoid duplicated token billing", "error", err)
+				sh.finishResponse("end_turn")
+				return
+			}
 
 			// Check for non-retriable errors
 			errStr := err.Error()
 			errClass := classifyUpstreamError(errStr)
-			slog.Error("Request error", "error", err, "category", errClass.category, "retryable", errClass.retryable)
+			slog.Error("Request error", "error", err, "category", errClass.Category, "retryable", errClass.Retryable)
 			// 标记账号状态（auth 类错误始终标记，无论是否可重试）
 			if currentAccount != nil && h.loadBalancer != nil && h.loadBalancer.Store != nil {
 				if status := classifyAccountStatus(errStr); status != "" {
 					// Mark status if it's auth-related OR if it's a 429 (rate limit)
 					// We want to rotate accounts on 429 even if we retry the request on a new account
-					if !errClass.retryable || errClass.category == "auth" || status == "429" {
-						slog.Info("标记账号状态", "account_id", currentAccount.ID, "status", status, "category", errClass.category)
+					if !errClass.Retryable || errClass.Category == "auth" || status == "429" {
+						slog.Info("标记账号状态", "account_id", currentAccount.ID, "status", status, "category", errClass.Category)
 						markAccountStatus(r.Context(), h.loadBalancer.Store, currentAccount, status)
 					}
 				}
 			}
 
-			if !errClass.retryable {
-				slog.Error("Aborting retries for non-retriable error", "error", err, "category", errClass.category)
-				if errClass.category == "auth_blocked" || errClass.category == "auth" {
-					sh.InjectAuthError(errClass.category, errStr)
+			if !errClass.Retryable {
+				slog.Error("Aborting retries for non-retriable error", "error", err, "category", errClass.Category)
+				if errClass.Category == "auth_blocked" || errClass.Category == "auth" {
+					sh.InjectAuthError(errClass.Category, errStr)
 				}
 				sh.finishResponse("end_turn")
 				return
@@ -713,8 +683,8 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 				if currentAccount != nil && h.loadBalancer != nil {
 					slog.Error("Account request failed, max retries reached", "account", currentAccount.Name)
 				}
-				if errClass.category == "auth" || errClass.category == "auth_blocked" {
-					sh.InjectAuthError(errClass.category, errStr)
+				if errClass.Category == "auth" || errClass.Category == "auth_blocked" {
+					sh.InjectAuthError(errClass.Category, errStr)
 				} else {
 					sh.InjectRetryExhaustedError(errStr)
 				}
@@ -722,7 +692,7 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			retriesRemaining--
-			if errClass.switchAccount && currentAccount != nil && h.loadBalancer != nil {
+			if errClass.SwitchAccount && currentAccount != nil && h.loadBalancer != nil {
 				if _, ok := failedAccountSet[currentAccount.ID]; !ok {
 					failedAccountSet[currentAccount.ID] = struct{}{}
 					failedAccountIDs = append(failedAccountIDs, currentAccount.ID)
@@ -754,7 +724,7 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			}
 			if retryDelay > 0 {
 				attempt := maxRetries - retriesRemaining + 1
-				delay := computeRetryDelay(retryDelay, attempt, errClass.category)
+				delay := computeRetryDelay(retryDelay, attempt, errClass.Category)
 				if delay > 0 && !util.SleepWithContext(r.Context(), delay) {
 					sh.finishResponse("end_turn")
 					return
@@ -824,6 +794,37 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	// Sync state and update stats using helpers
 	h.syncWarpState(currentAccount, apiClient, accountSnapshot)
 	h.updateAccountStats(currentAccount, sh.inputTokens, sh.outputTokens)
+
+	// Audit log
+	if h.auditLogger != nil {
+		accountID := int64(0)
+		channel := forcedChannel
+		if currentAccount != nil {
+			accountID = currentAccount.ID
+			if channel == "" {
+				channel = currentAccount.AccountType
+			}
+		}
+		status := "success"
+		if sh.finalStopReason == "" && !sh.hasReturn {
+			status = "error"
+		}
+		h.auditLogger.Log(r.Context(), audit.Event{
+			Action:    "chat_request",
+			AccountID: accountID,
+			Model:     req.Model,
+			Channel:   channel,
+			ClientIP:  r.RemoteAddr,
+			UserAgent: r.UserAgent(),
+			Duration:  time.Since(startTime).Milliseconds(),
+			Status:    status,
+			Metadata: map[string]interface{}{
+				"input_tokens":  sh.inputTokens,
+				"output_tokens": sh.outputTokens,
+				"stream":        isStream,
+			},
+		})
+	}
 }
 
 func randomSessionID() string {

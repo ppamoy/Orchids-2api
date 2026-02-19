@@ -16,13 +16,18 @@ import (
 	"orchids-api/internal/debug"
 	"orchids-api/internal/prompt"
 	"orchids-api/internal/upstream"
+	"orchids-api/internal/util"
 )
 
 var orchidsAIClientModels = []string{
 	"claude-sonnet-4-5",
+	"claude-opus-4-6",
+	"claude-opus-4.6",
 	"claude-opus-4-5",
 	"claude-opus-4.5",
 	"claude-haiku-4-5",
+	"claude-opus-4-6-thinking",
+	"claude-opus-4.6-thinking",
 	"claude-sonnet-4-5-thinking",
 	"claude-opus-4-5-thinking",
 	"claude-sonnet-4-20250514",
@@ -94,6 +99,11 @@ func (c *Client) sendRequestWSAIClient(ctx context.Context, req upstream.Upstrea
 	defer cancel()
 	startPool := time.Now()
 
+	proxyFunc := http.ProxyFromEnvironment
+	if c.config != nil {
+		proxyFunc = util.ProxyFunc(c.config.ProxyHTTP, c.config.ProxyHTTPS, c.config.ProxyUser, c.config.ProxyPass, c.config.ProxyBypass)
+	}
+
 	// Get connection from pool (or create new if pool unavailable)
 	var conn *websocket.Conn
 	var err error
@@ -118,6 +128,7 @@ func (c *Client) sendRequestWSAIClient(ctx context.Context, req upstream.Upstrea
 			}
 			dialer := websocket.Dialer{
 				HandshakeTimeout: orchidsWSConnectTimeout,
+				Proxy:            proxyFunc,
 			}
 			conn, _, err = dialer.DialContext(ctx, wsURL, headers)
 			if err != nil {
@@ -160,6 +171,7 @@ func (c *Client) sendRequestWSAIClient(ctx context.Context, req upstream.Upstrea
 		}
 		dialer := websocket.Dialer{
 			HandshakeTimeout: orchidsWSConnectTimeout,
+			Proxy:            proxyFunc,
 		}
 		conn, _, err = dialer.DialContext(ctx, wsURL, headers)
 		if err != nil {
@@ -208,6 +220,7 @@ func (c *Client) sendRequestWSAIClient(ctx context.Context, req upstream.Upstrea
 
 	startFirstToken := time.Now()
 	firstReceived := false
+	receivedAnyMessage := false
 
 	var state requestState
 	var fsWG sync.WaitGroup
@@ -255,7 +268,7 @@ func (c *Client) sendRequestWSAIClient(ctx context.Context, req upstream.Upstrea
 				returnToPool = false
 				return ctx.Err()
 			}
-			if parentCtx.Err() == nil {
+			if parentCtx.Err() == nil && !receivedAnyMessage {
 				returnToPool = false
 				return wsFallbackError{err: err}
 			}
@@ -273,7 +286,7 @@ func (c *Client) sendRequestWSAIClient(ctx context.Context, req upstream.Upstrea
 				returnToPool = false
 				break
 			}
-			if parentCtx.Err() == nil {
+			if parentCtx.Err() == nil && !receivedAnyMessage {
 				returnToPool = false
 				return wsFallbackError{err: err}
 			}
@@ -285,6 +298,7 @@ func (c *Client) sendRequestWSAIClient(ctx context.Context, req upstream.Upstrea
 		if err := json.Unmarshal(data, &msg); err != nil {
 			continue
 		}
+		receivedAnyMessage = true
 
 		if !firstReceived && c.config.DebugEnabled {
 			firstReceived = true
@@ -702,10 +716,7 @@ func (c *Client) buildWSURLAIClient(token string) string {
 	if c.config == nil {
 		return ""
 	}
-	wsURL := strings.TrimSpace(c.config.OrchidsWSURL)
-	if wsURL == "" {
-		wsURL = orchidsWSDefaultURL
-	}
+	wsURL := c.config.OrchidsWSURL
 	sep := "?"
 	if strings.Contains(wsURL, "?") {
 		sep = "&"
@@ -735,23 +746,30 @@ func (c *Client) buildWSRequestAIClient(req upstream.UpstreamRequest) (*orchidsW
 		historyMessages = req.Messages
 	}
 	chatHistory, historyToolResults := convertChatHistoryAIClient(historyMessages)
+	if provided := normalizeProvidedChatHistory(req.ChatHistory); len(provided) > 0 {
+		// Prefer caller-provided history (already budgeted by handler) to avoid WS re-expanding context.
+		chatHistory = provided
+	}
+
 	toolResults := mergeToolResults(historyToolResults, currentToolResults)
 	orchidsTools := convertOrchidsTools(req.Tools)
 	attachmentUrls := extractAttachmentURLsAIClient(req.Messages)
 
+	maxTokens := 12000
+	if c.config != nil && c.config.ContextMaxTokens > 0 {
+		maxTokens = c.config.ContextMaxTokens
+	}
+
 	promptText := ""
 	if req.Prompt != "" {
 		promptText = req.Prompt
-		// 非 AIClient 模式下，若 prompt 已包含完整历史，则避免 chatHistory 重复注入。
-		if c.config == nil || !strings.EqualFold(strings.TrimSpace(c.config.OrchidsImpl), "aiclient") {
-			chatHistory = nil
-		}
 	} else {
-		promptText = buildLocalAssistantPrompt(systemText, userText, req.Model, req.Workdir)
+		promptText = buildLocalAssistantPrompt(systemText, userText, req.Model, req.Workdir, maxTokens)
 		if !req.NoThinking && !isSuggestionModeText(userText) {
 			promptText = injectThinkingPrefix(promptText)
 		}
 	}
+	promptText, chatHistory = enforceAIClientBudget(promptText, chatHistory, maxTokens)
 
 	if req.NoTools {
 		orchidsTools = nil
@@ -795,6 +813,63 @@ func (c *Client) buildWSRequestAIClient(req upstream.UpstreamRequest) (*orchidsW
 	}, nil
 }
 
+func normalizeProvidedChatHistory(raw []interface{}) []map[string]string {
+	if len(raw) == 0 {
+		return nil
+	}
+
+	normalizeRole := func(role string) (string, bool) {
+		switch strings.ToLower(strings.TrimSpace(role)) {
+		case "user":
+			return "user", true
+		case "assistant":
+			return "assistant", true
+		default:
+			return "", false
+		}
+	}
+
+	history := make([]map[string]string, 0, len(raw))
+	for _, item := range raw {
+		var role string
+		var content string
+
+		switch v := item.(type) {
+		case map[string]string:
+			role = v["role"]
+			content = v["content"]
+		case map[string]interface{}:
+			if s, ok := v["role"].(string); ok {
+				role = s
+			}
+			if s, ok := v["content"].(string); ok {
+				content = s
+			}
+		default:
+			continue
+		}
+
+		normalizedRole, ok := normalizeRole(role)
+		if !ok {
+			continue
+		}
+		content = strings.TrimSpace(content)
+		if content == "" {
+			continue
+		}
+
+		history = append(history, map[string]string{
+			"role":    normalizedRole,
+			"content": content,
+		})
+	}
+
+	if len(history) == 0 {
+		return nil
+	}
+	return history
+}
+
 func isSuggestionModeText(text string) bool {
 	normalized := strings.ToLower(text)
 	return strings.Contains(normalized, "suggestion mode")
@@ -809,6 +884,11 @@ func normalizeAIClientModel(model string) string {
 	case "claude-haiku-4-5":
 		// Orchids 不支持 haiku，降级到 sonnet
 		mapped = "claude-sonnet-4-5"
+	case "claude-opus-4-6", "claude-opus-4.6":
+		// 兼容 4.6 的点号/横杠写法
+		mapped = "claude-opus-4-6"
+	case "claude-opus-4-6-thinking", "claude-opus-4.6-thinking":
+		mapped = "claude-opus-4-6-thinking"
 	case "claude-opus-4-5":
 		mapped = "claude-opus-4.5"
 	case "claude-sonnet-4-5-thinking":
@@ -907,7 +987,6 @@ func convertChatHistoryAIClient(messages []prompt.Message) ([]map[string]string,
 		if msg.Role == "user" {
 			if msg.Content.IsString() {
 				text := stripSystemReminders(msg.Content.GetText())
-				text = truncateHistoryContent(text)
 				if text != "" {
 					history = append(history, map[string]string{
 						"role":    "user",
@@ -957,7 +1036,6 @@ func convertChatHistoryAIClient(messages []prompt.Message) ([]map[string]string,
 				continue
 			}
 			text := strings.TrimSpace(strings.Join(textParts, "\n"))
-			text = truncateHistoryContent(text)
 			if text != "" {
 				history = append(history, map[string]string{
 					"role":    "user",
@@ -969,7 +1047,6 @@ func convertChatHistoryAIClient(messages []prompt.Message) ([]map[string]string,
 
 		if msg.Content.IsString() {
 			text := stripSystemReminders(msg.Content.GetText())
-			text = truncateHistoryContent(text)
 			if text == "" {
 				continue
 			}
@@ -997,7 +1074,6 @@ func convertChatHistoryAIClient(messages []prompt.Message) ([]map[string]string,
 			}
 		}
 		text := strings.TrimSpace(strings.Join(parts, "\n"))
-		text = truncateHistoryContent(text)
 		if text == "" {
 			continue
 		}

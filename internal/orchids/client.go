@@ -11,7 +11,6 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"net/http"
-	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -23,6 +22,7 @@ import (
 	"orchids-api/internal/prompt"
 	"orchids-api/internal/store"
 	"orchids-api/internal/upstream"
+	"orchids-api/internal/util"
 )
 
 const defaultUpstreamBaseURL = "https://orchids-server.calmstone-6964e08a.westeurope.azurecontainerapps.io"
@@ -101,7 +101,6 @@ func shouldLogNoActiveSession(key string) bool {
 
 func newHTTPClient(cfg *config.Config) *http.Client {
 	transport := &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
 		MaxIdleConns:          100,
 		MaxIdleConnsPerHost:   100,
 		IdleConnTimeout:       90 * time.Second,
@@ -110,13 +109,10 @@ func newHTTPClient(cfg *config.Config) *http.Client {
 		ResponseHeaderTimeout: 30 * time.Second,
 	}
 
-	if cfg != nil && cfg.ProxyHTTP != "" {
-		if u, err := url.Parse(cfg.ProxyHTTP); err == nil {
-			if cfg.ProxyUser != "" && cfg.ProxyPass != "" {
-				u.User = url.UserPassword(cfg.ProxyUser, cfg.ProxyPass)
-			}
-			transport.Proxy = http.ProxyURL(u)
-		}
+	if cfg != nil {
+		transport.Proxy = util.ProxyFunc(cfg.ProxyHTTP, cfg.ProxyHTTPS, cfg.ProxyUser, cfg.ProxyPass, cfg.ProxyBypass)
+	} else {
+		transport.Proxy = http.ProxyFromEnvironment
 	}
 
 	return &http.Client{
@@ -167,6 +163,9 @@ func NewFromAccount(acc *store.Account, base *config.Config) *Client {
 		cfg.MaxRetries = base.MaxRetries
 		cfg.RetryDelay = base.RetryDelay
 		cfg.RequestTimeout = base.RequestTimeout
+		cfg.SuppressThinking = base.SuppressThinking
+		cfg.OrchidsMaxToolResults = base.OrchidsMaxToolResults
+		cfg.OrchidsMaxHistoryMessages = base.OrchidsMaxHistoryMessages
 
 		// Copy Proxy Config
 		cfg.ProxyHTTP = base.ProxyHTTP
@@ -194,6 +193,65 @@ func (c *Client) GetToken() (string, error) {
 		return c.config.UpstreamToken, nil
 	}
 
+	// Orchids OAuth (AIClient-compatible): if we have __client, prefer fetching
+	// Clerk /v1/client and using sessions[0].last_active_token.jwt.
+	// That token is typically short-lived, so we cache by sessionID using its exp claim.
+	if c.account != nil {
+		if strings.TrimSpace(c.account.ClientCookie) != "" {
+			// If we already have a cached token for this session, use it.
+			if cached, ok := getCachedToken(strings.TrimSpace(c.account.SessionID)); ok {
+				return cached, nil
+			}
+
+			proxyFunc := http.ProxyFromEnvironment
+			if c.config != nil {
+				proxyFunc = util.ProxyFunc(c.config.ProxyHTTP, c.config.ProxyHTTPS, c.config.ProxyUser, c.config.ProxyPass, c.config.ProxyBypass)
+			}
+			info, err := clerk.FetchAccountInfoWithSessionProxy(c.account.ClientCookie, c.account.SessionCookie, proxyFunc)
+			if err == nil && info != nil {
+				// Update runtime config (used by some upstream payload fields)
+				c.applyAccountInfo(info)
+				// Persist rotated __client and identity fields back to store account snapshot
+				c.persistAccountInfo(info)
+				if strings.TrimSpace(info.SessionID) != "" {
+					// Ensure config has the latest session id/cookies then fetch a bearer token
+					// via the official Clerk tokens endpoint.
+					c.config.SessionID = strings.TrimSpace(info.SessionID)
+					bearer, tokErr := c.fetchToken()
+					if tokErr == nil && strings.TrimSpace(bearer) != "" {
+						setCachedToken(info.SessionID, bearer)
+						slog.Debug("Orchids token source", "source", "clerk_session_tokens_endpoint", "session_id", info.SessionID, "has_session_cookie", strings.TrimSpace(c.account.SessionCookie) != "")
+						return bearer, nil
+					}
+					if tokErr != nil {
+						slog.Warn("Orchids token fetch: tokens endpoint failed", "session_id", info.SessionID, "error", tokErr)
+					}
+				}
+				// Info returned but missing JWT/sessionID.
+				slog.Warn("Orchids token fetch: clerk info missing jwt/session", "has_jwt", strings.TrimSpace(info.JWT) != "", "session_id", info.SessionID)
+			} else if err != nil {
+				lower := strings.ToLower(err.Error())
+				if strings.Contains(lower, "no active sessions found") {
+					logKey := "clerk_info"
+					if c.account != nil {
+						logKey = fmt.Sprintf("clerk_info:acct:%d", c.account.ID)
+					}
+					if shouldLogNoActiveSession(logKey) {
+						slog.Debug("Orchids token fetch: clerk info failed (no active sessions)", "error", err)
+					}
+				} else {
+					slog.Warn("Orchids token fetch: clerk info failed", "error", err)
+				}
+			}
+			// If Clerk fetch fails, fall back to any stored token below.
+		}
+
+		// Per-account JWT: allow using a pasted bearer token directly.
+		if tok := strings.TrimSpace(c.account.Token); tok != "" {
+			return tok, nil
+		}
+	}
+
 	if c.config.AutoRefreshToken {
 		return c.forceRefreshToken()
 	}
@@ -211,7 +269,11 @@ func (c *Client) forceRefreshToken() (string, error) {
 	}
 
 	if strings.TrimSpace(c.config.ClientCookie) != "" {
-		info, err := clerk.FetchAccountInfoWithProjectAndSession(c.config.ClientCookie, c.config.SessionCookie, c.config.ProjectID)
+		proxyFunc := http.ProxyFromEnvironment
+		if c.config != nil {
+			proxyFunc = util.ProxyFunc(c.config.ProxyHTTP, c.config.ProxyHTTPS, c.config.ProxyUser, c.config.ProxyPass, c.config.ProxyBypass)
+		}
+		info, err := clerk.FetchAccountInfoWithProjectAndSessionProxy(c.config.ClientCookie, c.config.SessionCookie, c.config.ProjectID, proxyFunc)
 		if err == nil && info.JWT != "" {
 			c.applyAccountInfo(info)
 			c.persistAccountInfo(info)
@@ -268,7 +330,11 @@ func (c *Client) fetchToken() (string, error) {
 	}
 
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Cookie", c.config.GetCookies())
+	if strings.TrimSpace(c.config.SessionCookie) != "" {
+		req.Header.Set("Cookie", "__client="+c.config.ClientCookie+"; __session="+c.config.SessionCookie)
+	} else {
+		req.Header.Set("Cookie", "__client="+c.config.ClientCookie+"; __client_uat="+c.config.ClientUat)
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -419,13 +485,9 @@ func (c *Client) sendRequestSSE(ctx context.Context, req upstream.UpstreamReques
 		return fmt.Errorf("failed to get token: %w", err)
 	}
 
-	payloadMessages := req.Messages
-	payloadSystem := req.System
-	if cfg != nil && strings.EqualFold(strings.TrimSpace(cfg.OrchidsImpl), "aiclient") {
-		// AIClient 模式：避免 prompt + messages 双份注入上下文
-		payloadMessages = nil
-		payloadSystem = nil
-	}
+	// AIClient-only: avoid prompt + messages double-injection.
+	payloadMessages := []prompt.Message(nil)
+	payloadSystem := []prompt.SystemItem(nil)
 	projectID := ""
 	agentMode := ""
 	email := ""
@@ -435,6 +497,10 @@ func (c *Client) sendRequestSSE(ctx context.Context, req upstream.UpstreamReques
 		agentMode = cfg.AgentMode
 		email = cfg.Email
 		userID = cfg.UserID
+	}
+	payloadTools := compactIncomingTools(req.Tools)
+	if req.NoTools {
+		payloadTools = nil
 	}
 
 	payload := AgentRequest{
@@ -452,7 +518,7 @@ func (c *Client) sendRequestSSE(ctx context.Context, req upstream.UpstreamReques
 		Model:         req.Model,
 		Messages:      payloadMessages,
 		System:        payloadSystem,
-		Tools:         req.Tools,
+		Tools:         payloadTools,
 	}
 	if payload.ChatSessionID == "" {
 		payload.ChatSessionID = fmt.Sprintf("chat_%d", rand.IntN(90000000)+10000000)
@@ -624,7 +690,7 @@ func (c *Client) FetchUpstreamModels(ctx context.Context) ([]UpstreamModel, erro
 
 	// Replace /agent/coding-agent with /v1/models if needed, or just append /v1/models if base is different
 	baseURL := defaultUpstreamBaseURL
-	if c.config != nil && c.config.OrchidsAPIBaseURL != "" {
+	if c.config != nil {
 		baseURL = c.config.OrchidsAPIBaseURL
 	}
 	baseURL = strings.TrimSuffix(baseURL, "/")

@@ -5,11 +5,188 @@ let currentPlatform = '';
 let accountHealth = {};
 let pageSize = 20;
 let currentPage = 1;
+let modelCatalog = [];
+
+// DOM 缓存
+const domCache = {
+    accountsList: null,
+    paginationInfo: null,
+    paginationControls: null,
+};
+
+function initDOMCache() {
+    domCache.accountsList = document.getElementById("accountsList");
+    domCache.paginationInfo = document.getElementById("paginationInfo");
+    domCache.paginationControls = document.getElementById("paginationControls");
+}
+
+const fallbackAgentModes = {
+  orchids: [
+    "claude-sonnet-4-5",
+    "claude-opus-4-6",
+    "claude-opus-4-6-thinking",
+    "claude-opus-4-5",
+    "claude-sonnet-4-5-thinking",
+  ],
+  warp: [
+    "auto",
+    "auto-efficient",
+    "auto-genius",
+    "claude-4-5-sonnet",
+    "claude-4-5-sonnet-thinking",
+    "claude-4-5-opus",
+    "claude-4-5-opus-thinking",
+    "claude-4-6-opus-high",
+    "claude-4-6-opus-max",
+  ],
+  grok: [
+    "grok-3",
+    "grok-3-mini",
+    "grok-3-thinking",
+    "grok-4",
+    "grok-4-mini",
+    "grok-4-thinking",
+    "grok-4-heavy",
+    "grok-4.1-mini",
+    "grok-4.1-fast",
+    "grok-4.1-expert",
+    "grok-4.1-thinking",
+    "grok-imagine-1.0",
+    "grok-imagine-1.0-edit",
+    "grok-imagine-1.0-video",
+  ],
+};
+
+function normalizeChannel(channel) {
+  return String(channel || "orchids").trim().toLowerCase();
+}
+
+function isModelAvailable(model) {
+  if (!model) return false;
+  if (typeof model.status === "boolean") return model.status;
+  const status = String(model.status || "").toLowerCase();
+  if (!status) return true;
+  return status === "available";
+}
+
+function bySortOrder(a, b) {
+  const aOrderRaw = a && a.sort_order;
+  const bOrderRaw = b && b.sort_order;
+  const aOrder = Number.isFinite(Number(aOrderRaw)) ? Number(aOrderRaw) : 0;
+  const bOrder = Number.isFinite(Number(bOrderRaw)) ? Number(bOrderRaw) : 0;
+  if (aOrder !== bOrder) return aOrder - bOrder;
+  const aModelID = a && a.model_id ? a.model_id : "";
+  const bModelID = b && b.model_id ? b.model_id : "";
+  return String(aModelID).localeCompare(String(bModelID));
+}
+
+function getModelsForAccountType(type) {
+  const channel = normalizeChannel(type);
+  const active = modelCatalog
+    .filter((m) => normalizeChannel(m.channel) === channel)
+    .filter(isModelAvailable)
+    .sort(bySortOrder);
+
+  if (active.length > 0) return active;
+
+  const fallback = fallbackAgentModes[channel] || [];
+  return fallback.map((modelID, idx) => ({
+    model_id: modelID,
+    name: modelID,
+    sort_order: idx,
+    is_default: idx === 0,
+  }));
+}
+
+function setSelectOptions(select, options) {
+  if (!select) return;
+  select.innerHTML = "";
+  options.forEach((opt) => {
+    const el = document.createElement("option");
+    el.value = opt.value;
+    el.textContent = opt.label;
+    if (opt.selected) el.selected = true;
+    if (opt.disabled) el.disabled = true;
+    select.appendChild(el);
+  });
+}
+
+function renderAgentModeOptions(accountType, preferredValue = "") {
+  const select = document.getElementById("agentMode");
+  if (!select) return;
+
+  const models = getModelsForAccountType(accountType);
+  const preferred = String(preferredValue || "").trim();
+  const modelIDs = new Set(models.map((m) => String(m.model_id || "")));
+
+  const options = [];
+  let selectedValue = "";
+
+  if (preferred && !modelIDs.has(preferred)) {
+    options.push({
+      value: preferred,
+      label: `${preferred}（当前配置）`,
+      selected: true,
+    });
+    selectedValue = preferred;
+  }
+
+  models.forEach((m) => {
+    const modelID = String(m.model_id || "").trim();
+    if (!modelID) return;
+    const labelName = String(m.name || modelID).trim();
+    const label = labelName === modelID ? modelID : `${labelName} (${modelID})`;
+    options.push({
+      value: modelID,
+      label,
+    });
+  });
+
+  if (!selectedValue) {
+    if (preferred && modelIDs.has(preferred)) {
+      selectedValue = preferred;
+    } else {
+      const defaultModel = models.find((m) => m.is_default) || models[0];
+      selectedValue = defaultModel ? String(defaultModel.model_id || "") : "";
+    }
+  }
+
+  if (options.length === 0) {
+    options.push({ value: "", label: "暂无可用模型", selected: true, disabled: true });
+  } else {
+    const found = options.some((opt) => opt.value === selectedValue);
+    if (!found) {
+      selectedValue = String(options[0].value || "");
+    }
+    options.forEach((opt) => {
+      if (opt.value === selectedValue) opt.selected = true;
+    });
+  }
+
+  setSelectOptions(select, options);
+}
+
+async function loadModelCatalog() {
+  try {
+    const res = await fetch("/api/models");
+    if (!res.ok) {
+      throw new Error(`status ${res.status}`);
+    }
+    const list = await res.json();
+    modelCatalog = Array.isArray(list) ? list : [];
+  } catch (err) {
+    console.error("Failed to load models:", err);
+    modelCatalog = [];
+  }
+}
 
 // Load accounts from API
 async function loadAccounts() {
   try {
-    const res = await fetch("/api/accounts");
+    const [res] = await Promise.all([
+      fetch("/api/accounts"),
+      loadModelCatalog(),
+    ]);
     if (res.status === 401) {
       window.location.href = "./login.html";
       return;
@@ -36,11 +213,28 @@ function normalizeAccountType(acc) {
   return (acc.account_type || 'orchids').toLowerCase();
 }
 
+function getQuotaStats(acc) {
+  if (!acc) return null;
+  const limit = Math.floor(acc.usage_limit || 0);
+  if (limit <= 0) return null;
+  const type = normalizeAccountType(acc);
+  const current = Math.floor(acc.usage_current || 0);
+  let remaining = 0;
+  if (type === "warp") {
+    remaining = Math.max(0, limit - current);
+  } else {
+    remaining = Math.max(0, current);
+  }
+  const used = Math.max(0, limit - remaining);
+  const pctRemaining = limit > 0 ? Math.min(100, Math.round((remaining / limit) * 100)) : 0;
+  return { limit, remaining, used, pctRemaining };
+}
+
 function getAccountToken(acc) {
   if (!acc) return '';
   const type = normalizeAccountType(acc);
   if (type === 'warp') {
-    return acc.refresh_token || acc.client_cookie || '';
+    return acc.refresh_token || acc.token || acc.client_cookie || '';
   }
   return acc.client_cookie || '';
 }
@@ -54,6 +248,10 @@ function applyTokenLabels(type) {
     label.textContent = "Refresh Token";
     input.placeholder = "粘贴 refresh_token";
     hint.textContent = "Warp 只需要 refresh_token";
+  } else if (type === 'grok') {
+    label.textContent = "SSO Token";
+    input.placeholder = "粘贴 sso token（或包含 sso= 的 Cookie）";
+    hint.textContent = "Grok 使用 sso token（支持纯 token 或 Cookie 片段）";
   } else {
     label.textContent = "Client Cookie / JWT";
     input.placeholder = "粘贴 Clerk Cookie 或 JWT";
@@ -65,7 +263,7 @@ function applyTokenLabels(type) {
 function renderPlatformTabs() {
   const container = document.getElementById("platformFilters");
   if (!container) return;
-  const defaultTypes = ["orchids", "warp"];
+  const defaultTypes = ["orchids", "warp", "grok"];
   const types = new Set([...defaultTypes, ...accounts.map(normalizeAccountType)]);
   const sorted = Array.from(types).sort();
   const tabs = [...sorted];
@@ -99,61 +297,82 @@ function updateAccountHealth(id, ok, msg = '') {
   };
 }
 
-// Get status badge for account
-function statusBadge(acc) {
+function normalizeStatusCode(statusCode) {
+  if (statusCode === null || statusCode === undefined) return '';
+  return String(statusCode).trim();
+}
+
+function evaluateAccountStatus(acc) {
   const health = accountHealth[acc.id];
   if (health && !health.ok) {
-    return { text: '异常', color: '#fb7185', bg: 'rgba(251, 113, 133, 0.16)', tip: health.msg || '检测失败' };
+    return { normal: false, text: '异常', color: '#fb7185', bg: 'rgba(251, 113, 133, 0.16)', tip: health.msg || '检测失败' };
   }
   if (!acc.enabled) {
-    return { text: '禁用', color: '#fb7185', bg: 'rgba(251, 113, 133, 0.16)', tip: '账号已禁用' };
+    return { normal: false, text: '禁用', color: '#fb7185', bg: 'rgba(251, 113, 133, 0.16)', tip: '账号已禁用' };
   }
-  // Check backend status_code
-  if (acc.status_code) {
-    switch (acc.status_code) {
+  const statusCode = normalizeStatusCode(acc.status_code);
+  if (statusCode) {
+    switch (statusCode) {
       case '429':
-        return { text: '限流', color: '#f59e0b', bg: 'rgba(245, 158, 11, 0.16)', tip: '请求过于频繁 (429)' };
+        return { normal: false, text: '限流', color: '#f59e0b', bg: 'rgba(245, 158, 11, 0.16)', tip: '请求过于频繁 (429)' };
       case '401':
-        return { text: '未授权', color: '#fb7185', bg: 'rgba(251, 113, 133, 0.16)', tip: '认证失败 (401)' };
+        return { normal: false, text: '未授权', color: '#fb7185', bg: 'rgba(251, 113, 133, 0.16)', tip: '认证失败 (401)' };
       case '403':
-        return { text: '禁止访问', color: '#fb7185', bg: 'rgba(251, 113, 133, 0.16)', tip: '访问被拒绝 (403)' };
+        return { normal: false, text: '禁止访问', color: '#fb7185', bg: 'rgba(251, 113, 133, 0.16)', tip: '访问被拒绝 (403)' };
       case '404':
-        return { text: '不存在', color: '#fb7185', bg: 'rgba(251, 113, 133, 0.16)', tip: '资源不存在 (404)' };
+        return { normal: false, text: '不存在', color: '#fb7185', bg: 'rgba(251, 113, 133, 0.16)', tip: '资源不存在 (404)' };
       default:
-        return { text: '异常', color: '#fb7185', bg: 'rgba(251, 113, 133, 0.16)', tip: '状态异常: ' + acc.status_code };
+        return { normal: false, text: '异常', color: '#fb7185', bg: 'rgba(251, 113, 133, 0.16)', tip: '状态异常: ' + statusCode };
     }
   }
+
   const type = normalizeAccountType(acc);
   if (type === 'warp') {
     if (!getAccountToken(acc)) {
-      return { text: '待补全', color: '#f59e0b', bg: 'rgba(245, 158, 11, 0.16)', tip: '缺少 Refresh Token' };
+      return { normal: false, text: '待补全', color: '#f59e0b', bg: 'rgba(245, 158, 11, 0.16)', tip: '缺少 Refresh Token' };
+    }
+  } else if (type === 'grok') {
+    if (!getAccountToken(acc)) {
+      return { normal: false, text: '待补全', color: '#f59e0b', bg: 'rgba(245, 158, 11, 0.16)', tip: '缺少 SSO Token' };
     }
   } else if (!acc.session_id && !acc.session_cookie) {
-    return { text: '待补全', color: '#f59e0b', bg: 'rgba(245, 158, 11, 0.16)', tip: '缺少会话信息' };
+    return { normal: false, text: '待补全', color: '#f59e0b', bg: 'rgba(245, 158, 11, 0.16)', tip: '缺少会话信息' };
   }
-  if (type === 'warp' && acc.usage_limit > 0) {
-    const used = acc.usage_current || 0;
-    if (used >= acc.usage_limit) {
-      return { text: '配额已满', color: '#fb7185', bg: 'rgba(251, 113, 133, 0.16)', tip: '配额已用尽 (已用 ' + Math.floor(used) + ' / ' + Math.floor(acc.usage_limit) + ')' };
-    }
+
+  const quota = getQuotaStats(acc);
+  if (quota && quota.limit > 0 && quota.remaining <= 0) {
+    return { normal: false, text: '配额已满', color: '#fb7185', bg: 'rgba(251, 113, 133, 0.16)', tip: '配额已用尽 (剩余 0 / ' + quota.limit.toLocaleString() + ')' };
   }
-  return { text: '正常', color: '#34d399', bg: 'rgba(52, 211, 153, 0.16)', tip: '状态正常' };
+
+  return { normal: true, text: '正常', color: '#34d399', bg: 'rgba(52, 211, 153, 0.16)', tip: '状态正常' };
+}
+
+function isAccountAbnormal(acc) {
+  return !evaluateAccountStatus(acc).normal;
+}
+
+// Get status badge for account
+function statusBadge(acc) {
+  return evaluateAccountStatus(acc);
 }
 
 // Check single account
 async function checkAccount(id, silent = false) {
+  const acc = accounts.find((a) => a.id === id);
+  const action = "check";
+  const actionText = "检查";
   try {
-    const res = await fetch(`/api/accounts/${id}/refresh`);
+    const res = await fetch(`/api/accounts/${id}/${action}`);
     if (!res.ok) {
       throw new Error(await res.text());
     }
     const updated = await res.json();
     accounts = accounts.map(a => (a.id === id ? updated : a));
     updateAccountHealth(id, true);
-    if (!silent) showToast(`账号 ${updated.name || updated.email || id} 正常`, "success");
+    if (!silent) showToast(`账号 ${updated.name || updated.email || id} ${actionText}完成`, "success");
   } catch (err) {
     updateAccountHealth(id, false, err.message || String(err));
-    if (!silent) showToast(`账号 ${id} 检测失败`, "error");
+    if (!silent) showToast(`账号 ${id} ${actionText}失败`, "error");
   } finally {
     renderAccounts();
     updateStats();
@@ -182,7 +401,7 @@ async function deleteAllAccounts() {
 
 // Clear abnormal accounts
 async function clearAbnormalAccounts() {
-  const abnormal = accounts.filter(a => !a.enabled || a.status_code || (accountHealth[a.id] && !accountHealth[a.id].ok));
+  const abnormal = accounts.filter(isAccountAbnormal);
   if (abnormal.length === 0) {
     showToast("没有异常账号", "info");
     return;
@@ -209,9 +428,86 @@ async function batchDeleteAccounts() {
   }
 }
 
+function getSelectedAccountIDs() {
+  return Array.from(document.querySelectorAll(".row-checkbox:checked"))
+    .map((cb) => parseDataId(cb.dataset.id || ""))
+    .map((id) => Number(id))
+    .filter((id) => Number.isFinite(id) && id > 0);
+}
+
+// Enable NSFW for selected Grok accounts, or all Grok accounts when nothing selected.
+async function enableNSFW() {
+  const selectedIDs = getSelectedAccountIDs();
+  const selectedGrokIDs = selectedIDs.filter((id) => {
+    const acc = accounts.find((item) => item.id === id);
+    return !!acc && normalizeAccountType(acc) === "grok";
+  });
+
+  const payload = { concurrency: 5 };
+  let targetText = "全部 Grok 账号";
+
+  if (selectedIDs.length > 0) {
+    if (selectedGrokIDs.length === 0) {
+      showToast("选中的账号中没有 Grok 账号", "info");
+      return;
+    }
+    payload.account_ids = selectedGrokIDs;
+    targetText = `选中的 ${selectedGrokIDs.length} 个 Grok 账号`;
+    if (!confirm(`确认对${targetText}启用 NSFW 吗？`)) return;
+  } else if (!confirm("未选中账号，将对全部 Grok 账号启用 NSFW，是否继续？")) {
+    return;
+  }
+
+  try {
+    showToast(`正在为${targetText}启用 NSFW...`, "info");
+    const res = await fetch("/api/v1/admin/tokens/nsfw/enable", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    if (res.status === 401) {
+      window.location.href = "./login.html";
+      return;
+    }
+    if (!res.ok) {
+      throw new Error(await res.text());
+    }
+
+    const out = await res.json();
+    const summary = out && out.summary ? out.summary : {};
+    const total = Number(summary.total || 0);
+    const ok = Number(summary.ok || 0);
+    const fail = Number(summary.fail || Math.max(0, total - ok));
+
+    if (ok > 0) {
+      await loadAccounts();
+    }
+
+    if (fail > 0) {
+      const failedList = Object.entries(out && out.results ? out.results : {})
+        .filter(([, item]) => !item || item.success !== true)
+        .slice(0, 3)
+        .map(([token, item]) => {
+          const msg = item && item.error ? item.error : `HTTP ${item && item.http_status ? item.http_status : 0}`;
+          return `${token}: ${msg}`;
+        });
+      if (failedList.length > 0) {
+        console.warn("NSFW enable failures:", failedList.join(" | "));
+      }
+      showToast(`NSFW 启用完成：成功 ${ok}，失败 ${fail}`, "error");
+      return;
+    }
+
+    showToast(`NSFW 启用成功：共 ${ok}/${total}`, "success");
+  } catch (err) {
+    showToast(`NSFW 启用失败: ${err.message || err}`, "error");
+  }
+}
+
 // Render accounts table
 function renderAccounts() {
-  const container = document.getElementById("accountsList");
+  const container = domCache.accountsList || document.getElementById("accountsList");
   const filtered = accounts.filter(acc => {
     if (!currentPlatform) return true;
     const key = currentPlatform.toLowerCase();
@@ -246,7 +542,8 @@ function renderAccounts() {
     empty.appendChild(icon);
     empty.appendChild(text);
     container.appendChild(empty);
-    document.getElementById("paginationInfo").textContent = `共 0 条记录，第 1/1 页`;
+    const paginationInfo = domCache.paginationInfo || document.getElementById("paginationInfo");
+    paginationInfo.textContent = `共 0 条记录，第 1/1 页`;
     renderPagination(1, 1);
     return;
   }
@@ -263,7 +560,6 @@ function renderAccounts() {
     { label: "ID", style: "width: 60px;" },
     { label: "Token" },
     { label: "模型" },
-    { label: "今日用量", style: "width: 100px;" },
     { label: "配额", style: "width: 140px;" },
     { label: "状态" },
     { label: "调用" },
@@ -288,6 +584,9 @@ function renderAccounts() {
   table.appendChild(thead);
 
   const tbody = document.createElement("tbody");
+  
+  // 使用 DocumentFragment 批量构建表格行
+  const fragment = document.createDocumentFragment();
   pageItems.forEach((acc) => {
     const badge = statusBadge(acc);
     const tokenDisplay = formatTokenDisplay(acc);
@@ -326,22 +625,13 @@ function renderAccounts() {
     tdModel.appendChild(modelSpan);
     tr.appendChild(tdModel);
 
-    const tdUsage = document.createElement("td");
-    const usageCurrent = acc.usage_daily || 0;
-    tdUsage.style.fontSize = "0.9rem";
-    tdUsage.style.color = "#94a3b8";
-    tdUsage.textContent = usageCurrent.toFixed(2);
-    tr.appendChild(tdUsage);
-
     const tdQuota = document.createElement("td");
     tdQuota.style.fontSize = "0.85rem";
-    const type = normalizeAccountType(acc);
-    if (type === 'warp' && acc.usage_limit > 0) {
-      const used = Math.floor(acc.usage_current || 0);
-      const limit = Math.floor(acc.usage_limit);
-      const pct = limit > 0 ? Math.min(100, Math.round((used / limit) * 100)) : 0;
-      const color = pct >= 90 ? "#fb7185" : pct >= 70 ? "#f59e0b" : "#34d399";
-      tdQuota.innerHTML = `<span style="color:${color}">${used.toLocaleString()} / ${limit.toLocaleString()}</span> <span style="color:#64748b;font-size:0.75rem">(${pct}%)</span>`;
+    const quota = getQuotaStats(acc);
+    if (quota) {
+      const pct = quota.pctRemaining;
+      const color = pct <= 10 ? "#fb7185" : pct <= 30 ? "#f59e0b" : "#34d399";
+      tdQuota.innerHTML = `<span style="color:${color}">${quota.remaining.toLocaleString()} / ${quota.limit.toLocaleString()}</span> <span style="color:#64748b;font-size:0.75rem">(剩余)</span>`;
     } else {
       tdQuota.style.color = "#64748b";
       tdQuota.textContent = "-";
@@ -349,6 +639,11 @@ function renderAccounts() {
     tr.appendChild(tdQuota);
 
     const tdStatus = document.createElement("td");
+    const statusWrap = document.createElement("div");
+    statusWrap.style.display = "flex";
+    statusWrap.style.alignItems = "center";
+    statusWrap.style.gap = "6px";
+
     const statusSpan = document.createElement("span");
     statusSpan.className = "tag tag-status-normal";
     statusSpan.title = badge.tip || "";
@@ -356,7 +651,20 @@ function renderAccounts() {
     statusSpan.style.color = badge.color;
     statusSpan.style.border = "none";
     statusSpan.textContent = badge.text;
-    tdStatus.appendChild(statusSpan);
+    statusWrap.appendChild(statusSpan);
+
+    if (normalizeAccountType(acc) === "grok" && acc.nsfw_enabled === true) {
+      const nsfwSpan = document.createElement("span");
+      nsfwSpan.className = "tag";
+      nsfwSpan.title = "已开启 NSFW";
+      nsfwSpan.style.background = "rgba(239, 68, 68, 0.16)";
+      nsfwSpan.style.color = "#fda4af";
+      nsfwSpan.style.border = "none";
+      nsfwSpan.textContent = "NSFW";
+      statusWrap.appendChild(nsfwSpan);
+    }
+
+    tdStatus.appendChild(statusWrap);
     tr.appendChild(tdStatus);
 
     const tdCount = document.createElement("td");
@@ -390,7 +698,7 @@ function renderAccounts() {
     refresh.className = "action-icon";
     refresh.dataset.action = "refresh";
     refresh.dataset.id = encodeData(acc.id);
-    refresh.title = "刷新";
+    refresh.title = "检查";
     refresh.textContent = "🔄";
 
     const del = document.createElement("i");
@@ -406,13 +714,18 @@ function renderAccounts() {
     tdActions.appendChild(actionWrap);
     tr.appendChild(tdActions);
 
-    tbody.appendChild(tr);
+    // 将行添加到 fragment 而不是直接添加到 tbody
+    fragment.appendChild(tr);
   });
+  
+  // 一次性将所有行插入到 tbody
+  tbody.appendChild(fragment);
   table.appendChild(tbody);
   wrap.appendChild(table);
   container.appendChild(wrap);
 
-  document.getElementById("paginationInfo").textContent = `共 ${total} 条记录，第 ${currentPage}/${totalPages} 页`;
+  const paginationInfo = domCache.paginationInfo || document.getElementById("paginationInfo");
+  paginationInfo.textContent = `共 ${total} 条记录，第 ${currentPage}/${totalPages} 页`;
   renderPagination(currentPage, totalPages);
   updateSelectedCount();
 
@@ -442,7 +755,7 @@ function renderAccounts() {
 }
 
 function renderPagination(current, total) {
-  const container = document.getElementById("paginationControls");
+  const container = domCache.paginationControls || document.getElementById("paginationControls");
   if (!container) return;
 
   container.innerHTML = "";
@@ -520,32 +833,25 @@ function updatePageSize(size) {
 // Update statistics
 function updateStats() {
   const total = accounts.length;
-  const enabled = accounts.filter((a) => a.enabled).length;
-  const abnormal = accounts.filter((a) => !a.enabled || a.status_code || (accountHealth[a.id] && !accountHealth[a.id].ok)).length;
+  const abnormal = accounts.filter(isAccountAbnormal).length;
+  const normal = Math.max(0, total - abnormal);
 
   document.getElementById("totalAccounts").textContent = total;
-  document.getElementById("enabledAccounts").textContent = enabled;
+  document.getElementById("enabledAccounts").textContent = normal;
   document.getElementById("disabledAccounts").textContent = abnormal;
 
   // Attempt to update selected if element exists (it should)
   updateSelectedCount();
-
-  const totalUsage = accounts.reduce((sum, acc) => sum + (acc.usage_daily || 0), 0);
 
   // Update sidebar footer
   const footerTotal = document.getElementById("footerTotal");
   if (footerTotal) footerTotal.textContent = total;
 
   const footerNormal = document.getElementById("footerNormal");
-  if (footerNormal) footerNormal.textContent = enabled;
+  if (footerNormal) footerNormal.textContent = normal;
 
   const footerAbnormal = document.getElementById("footerAbnormal");
   if (footerAbnormal) footerAbnormal.textContent = abnormal;
-
-  const footerUsage = document.getElementById("footerUsageText");
-  if (footerUsage) {
-    footerUsage.textContent = `${Math.floor(totalUsage)}`;
-  }
 }
 
 // Update selected count
@@ -572,27 +878,47 @@ function openModal(account = null) {
   const modal = document.getElementById("accountModal");
   const title = document.getElementById("modalTitle");
   const form = document.getElementById("accountForm");
+  const typeEl = document.getElementById("accountType");
+  const modeEl = document.getElementById("agentMode");
 
-  if (account) {
-    title.textContent = "编辑账号";
-    document.getElementById("accountId").value = account.id;
-    document.getElementById("accountType").value = account.account_type || "orchids";
-    document.getElementById("clientCookie").value = getAccountToken(account);
-    document.getElementById("agentMode").value = account.agent_mode || 'claude-opus-4.5';
-    document.getElementById("weight").value = account.weight || 1;
-    document.getElementById("enabled").checked = account.enabled;
-  } else {
-    title.textContent = "添加账号";
-    form.reset();
-    document.getElementById("accountId").value = "";
-    document.getElementById("agentMode").value = "claude-opus-4.5";
-    document.getElementById("weight").value = "1";
-    document.getElementById("accountType").value = "orchids";
-    document.getElementById("enabled").checked = true;
+  // 进入弹窗时先渲染一次占位，避免空白。
+  if (modeEl) {
+    modeEl.disabled = true;
+    setSelectOptions(modeEl, [{ value: "", label: "加载模型中...", selected: true, disabled: true }]);
   }
-  applyTokenLabels(document.getElementById("accountType").value);
-  modal.classList.add("active");
-  modal.style.display = "flex";
+
+  const finalizeModal = () => {
+    applyTokenLabels(typeEl ? typeEl.value : "orchids");
+    if (modeEl) modeEl.disabled = false;
+    modal.classList.add("active");
+    modal.style.display = "flex";
+  };
+
+  const applyValues = () => {
+    if (account) {
+      title.textContent = "编辑账号";
+      document.getElementById("accountId").value = account.id;
+      document.getElementById("accountType").value = normalizeAccountType(account);
+      document.getElementById("clientCookie").value = getAccountToken(account);
+      document.getElementById("weight").value = account.weight || 1;
+      document.getElementById("enabled").checked = account.enabled;
+      renderAgentModeOptions(document.getElementById("accountType").value, account.agent_mode || "");
+    } else {
+      title.textContent = "添加账号";
+      form.reset();
+      document.getElementById("accountId").value = "";
+      document.getElementById("weight").value = "1";
+      document.getElementById("accountType").value = "orchids";
+      document.getElementById("enabled").checked = true;
+      renderAgentModeOptions("orchids", "");
+    }
+  };
+
+  loadModelCatalog()
+    .finally(() => {
+      applyValues();
+      finalizeModal();
+    });
 }
 
 // Close modal
@@ -645,16 +971,10 @@ function editAccount(id) {
 
 // Refresh token
 async function refreshToken(id) {
-  try {
-    showToast("正在查询账号信息...", "info");
-    const res = await fetch(`/api/accounts/${id}/refresh`);
-    if (!res.ok) throw new Error(await res.text());
-    const acc = await res.json();
-    showToast(`账号 ${acc.email || id} 刷新完成`);
-    loadAccounts();
-  } catch (err) {
-    showToast("刷新失败: " + err.message, "error");
-  }
+  const acc = accounts.find((a) => a.id === id);
+  const actionText = "检查";
+  showToast(`正在${actionText}账号信息...`, "info");
+  await checkAccount(id, false);
 }
 
 // Delete account
@@ -706,10 +1026,16 @@ function formatTokenDisplay(acc) {
       if (type === 'warp') {
         // Warp tokens (JWTs) have long common prefixes, so show more of the end
         return token.substring(0, 10) + '...' + token.substring(token.length - 10);
+      } else if (type === 'grok') {
+        return token.substring(0, 8) + '...' + token.substring(token.length - 8);
       }
       return token.substring(0, 30) + '...';
     }
     return token;
+  }
+  if (type === 'grok' && getAccountToken(acc)) {
+    const sso = getAccountToken(acc);
+    return sso.length > 20 ? sso.substring(0, 8) + '...' + sso.substring(sso.length - 8) : sso;
   }
   if (type === 'warp' && getAccountToken(acc)) {
     const rt = getAccountToken(acc);
@@ -759,10 +1085,15 @@ async function importAccounts(event) {
 
 // Load accounts on page load
 document.addEventListener('DOMContentLoaded', () => {
+  initDOMCache();
   loadAccounts();
   const typeSelect = document.getElementById("accountType");
   if (typeSelect) {
-    typeSelect.addEventListener("change", () => applyTokenLabels(typeSelect.value));
+    typeSelect.addEventListener("change", () => {
+      applyTokenLabels(typeSelect.value);
+      renderAgentModeOptions(typeSelect.value, "");
+    });
     applyTokenLabels(typeSelect.value);
+    renderAgentModeOptions(typeSelect.value, "");
   }
 });

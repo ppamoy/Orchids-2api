@@ -45,9 +45,11 @@ func newRedisStore(addr, password string, db int, prefix string) (*redisStore, e
 	}
 
 	client := redis.NewClient(&redis.Options{
-		Addr:     addr,
-		Password: password,
-		DB:       db,
+		Addr:         addr,
+		Password:     password,
+		DB:           db,
+		PoolSize:     200,
+		MinIdleConns: 20,
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -60,6 +62,13 @@ func newRedisStore(addr, password string, db int, prefix string) (*redisStore, e
 		client: client,
 		prefix: prefix,
 	}, nil
+}
+
+func (s *redisStore) Client() *redis.Client {
+	if s == nil {
+		return nil
+	}
+	return s.client
 }
 
 func (s *redisStore) Close() error {
@@ -128,6 +137,7 @@ func (s *redisStore) UpdateAccount(ctx context.Context, acc *Account) error {
 	} else {
 		updated.AccountType = acc.AccountType
 	}
+	updated.NSFWEnabled = acc.NSFWEnabled
 	updated.SessionID = acc.SessionID
 	updated.ClientCookie = acc.ClientCookie
 	updated.RefreshToken = acc.RefreshToken
@@ -147,9 +157,7 @@ func (s *redisStore) UpdateAccount(ctx context.Context, acc *Account) error {
 	updated.Subscription = acc.Subscription
 	updated.UsageCurrent = acc.UsageCurrent
 	updated.UsageTotal = acc.UsageTotal
-	updated.UsageDaily = acc.UsageDaily
 	updated.UsageLimit = acc.UsageLimit
-	updated.ResetDate = acc.ResetDate
 	updated.StatusCode = acc.StatusCode
 	updated.LastAttempt = acc.LastAttempt
 	updated.QuotaResetAt = acc.QuotaResetAt
@@ -308,25 +316,18 @@ func (s *redisStore) IncrementAccountStats(ctx context.Context, id int64, usage 
 		
 		local acc = cjson.decode(val)
 		
-		-- Daily Reset Logic
-		local today = string.sub(now_str, 1, 10)
-		if acc.reset_date ~= today then
-			acc.usage_daily = 0
-			acc.reset_date = today
-		end
-
 		local acc_type = ""
 		if acc.account_type ~= nil then
 			acc_type = string.lower(tostring(acc.account_type))
 		end
 
 		-- Warp 的 usage_current 保存请求配额（由上游同步），
+		-- Orchids 的 usage_current 保存 credits（由 RSC 同步）。
 		-- 不能叠加 token 用量，否则会污染配额显示。
-		if acc_type ~= "warp" then
+		if acc_type ~= "warp" and acc_type ~= "orchids" then
 			acc.usage_current = (acc.usage_current or 0) + usage
 		end
 		acc.usage_total = (acc.usage_total or 0) + usage
-		acc.usage_daily = (acc.usage_daily or 0) + usage
 		acc.request_count = (acc.request_count or 0) + count
 		acc.last_used_at = now_str
 		acc.updated_at = now_str
@@ -369,6 +370,43 @@ func (s *redisStore) getAccount(ctx context.Context, id int64) (*Account, error)
 	return &acc, nil
 }
 
+// getAccountsByIDsPipelined 使用 Pipeline 批量获取账号数据
+func (s *redisStore) getAccountsByIDsPipelined(ctx context.Context, keys []string) ([]interface{}, error) {
+	if len(keys) == 0 {
+		return nil, nil
+	}
+
+	pipe := s.client.Pipeline()
+	cmds := make([]*redis.StringCmd, len(keys))
+
+	// 批量添加 GET 命令到 Pipeline
+	for i, key := range keys {
+		cmds[i] = pipe.Get(ctx, key)
+	}
+
+	// 执行 Pipeline
+	_, err := pipe.Exec(ctx)
+	if err != nil && err != redis.Nil {
+		return nil, err
+	}
+
+	// 收集结果
+	values := make([]interface{}, len(cmds))
+	for i, cmd := range cmds {
+		val, err := cmd.Result()
+		if err == redis.Nil {
+			values[i] = nil
+		} else if err != nil {
+			// 部分命令失败，返回错误触发回退
+			return nil, err
+		} else {
+			values[i] = val
+		}
+	}
+
+	return values, nil
+}
+
 func (s *redisStore) getAccountsByIDs(ctx context.Context, ids []string, onlyEnabled bool) ([]*Account, error) {
 	if len(ids) == 0 {
 		return nil, nil
@@ -394,13 +432,18 @@ func (s *redisStore) getAccountsByIDs(ctx context.Context, ids []string, onlyEna
 		keys = append(keys, s.accountsKey(id))
 	}
 
-	values, err := s.client.MGet(ctx, keys...).Result()
+	// 尝试使用 Pipeline 批量获取
+	values, err := s.getAccountsByIDsPipelined(ctx, keys)
 	if err != nil {
-		return nil, err
+		// Pipeline 失败，回退到单命令模式
+		values, err = s.client.MGet(ctx, keys...).Result()
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	// 并发阈值：少于 8 项时串行处理更高效
-	const parallelThreshold = 8
+	// 并发阈值：少于 32 项时串行处理更高效
+	const parallelThreshold = 32
 
 	if len(values) >= parallelThreshold {
 		// 并行解析 JSON
@@ -691,7 +734,7 @@ func (s *redisStore) getApiKeysByIDs(ctx context.Context, ids []string) ([]*ApiK
 		return nil, err
 	}
 
-	const parallelThreshold = 8
+	const parallelThreshold = 32
 
 	if len(values) >= parallelThreshold {
 		results := make([]*ApiKey, len(values))
@@ -791,7 +834,7 @@ func apiKeyRecordFromKey(key *ApiKey) apiKeyRecord {
 		ID:         key.ID,
 		Name:       key.Name,
 		KeyHash:    key.KeyHash,
-		KeyFull:    key.KeyFull,
+		KeyFull:    "",
 		KeyPrefix:  key.KeyPrefix,
 		KeySuffix:  key.KeySuffix,
 		Enabled:    key.Enabled,
@@ -836,6 +879,9 @@ func (s *redisStore) CreateModel(ctx context.Context, m *Model) error {
 	pipe := s.client.Pipeline()
 	pipe.Set(ctx, s.modelsKey(m.ID), data, 0)
 	pipe.SAdd(ctx, s.modelsIDsKey(), m.ID)
+	if strings.TrimSpace(m.ModelID) != "" {
+		pipe.HSet(ctx, s.modelsModelIDMapKey(), m.ModelID, m.ID)
+	}
 	_, err = pipe.Exec(ctx)
 	return err
 }
@@ -856,6 +902,9 @@ func (s *redisStore) UpdateModel(ctx context.Context, m *Model) error {
 	pipe := s.client.Pipeline()
 	pipe.Set(ctx, s.modelsKey(m.ID), data, 0)
 	pipe.SAdd(ctx, s.modelsIDsKey(), m.ID)
+	if strings.TrimSpace(m.ModelID) != "" {
+		pipe.HSet(ctx, s.modelsModelIDMapKey(), m.ModelID, m.ID)
+	}
 	_, err = pipe.Exec(ctx)
 	return err
 }
@@ -868,9 +917,15 @@ func (s *redisStore) DeleteModel(ctx context.Context, id string) error {
 		return nil
 	}
 
+	// Fetch model to get ModelID for index cleanup
+	m, _ := s.GetModel(ctx, id)
+
 	pipe := s.client.Pipeline()
 	pipe.Del(ctx, s.modelsKey(id))
 	pipe.SRem(ctx, s.modelsIDsKey(), id)
+	if m != nil && strings.TrimSpace(m.ModelID) != "" {
+		pipe.HDel(ctx, s.modelsModelIDMapKey(), m.ModelID)
+	}
 	_, err := pipe.Exec(ctx)
 	return err
 }
@@ -958,4 +1013,42 @@ func (s *redisStore) modelsIDsKey() string {
 
 func (s *redisStore) modelsNextIDKey() string {
 	return s.prefix + "models:next_id"
+}
+
+func (s *redisStore) modelsModelIDMapKey() string {
+	return s.prefix + "models:model_id_map"
+}
+
+func (s *redisStore) GetModelByModelID(ctx context.Context, modelID string) (*Model, error) {
+	if s == nil || s.client == nil {
+		return nil, fmt.Errorf("redis store not configured")
+	}
+	modelID = strings.TrimSpace(modelID)
+	if modelID == "" {
+		return nil, fmt.Errorf("model not found")
+	}
+
+	// Try hash index first for O(1) lookup
+	id, err := s.client.HGet(ctx, s.modelsModelIDMapKey(), modelID).Result()
+	if err == nil && id != "" {
+		m, err := s.GetModel(ctx, id)
+		if err == nil && m != nil {
+			return m, nil
+		}
+		// Index stale, fall through to scan
+	}
+
+	// Fallback to scan (for backward compatibility with existing data)
+	models, err := s.ListModels(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, m := range models {
+		if m.ModelID == modelID {
+			// Repair the index
+			s.client.HSet(ctx, s.modelsModelIDMapKey(), modelID, m.ID)
+			return m, nil
+		}
+	}
+	return nil, fmt.Errorf("model not found")
 }

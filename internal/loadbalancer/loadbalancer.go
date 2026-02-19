@@ -7,7 +7,6 @@ import (
 	"math/rand/v2"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"orchids-api/internal/auth"
@@ -26,7 +25,7 @@ type LoadBalancer struct {
 	cachedAccounts []*store.Account
 	cacheExpires   time.Time
 	cacheTTL       time.Duration
-	activeConns    sync.Map // map[int64]*atomic.Int64
+	connTracker    ConnTracker
 	sfGroup        singleflight.Group
 }
 
@@ -35,9 +34,15 @@ func NewWithCacheTTL(s *store.Store, cacheTTL time.Duration) *LoadBalancer {
 		cacheTTL = defaultCacheTTL
 	}
 	return &LoadBalancer{
-		Store:    s,
-		cacheTTL: cacheTTL,
+		Store:       s,
+		cacheTTL:    cacheTTL,
+		connTracker: NewMemoryConnTracker(),
 	}
+}
+
+// SetConnTracker replaces the default in-memory connection tracker.
+func (lb *LoadBalancer) SetConnTracker(ct ConnTracker) {
+	lb.connTracker = ct
 }
 
 func (lb *LoadBalancer) GetModelChannel(ctx context.Context, modelID string) string {
@@ -148,6 +153,13 @@ func (lb *LoadBalancer) selectAccount(accounts []*store.Account) *store.Account 
 		return accounts[0]
 	}
 
+	// Batch-fetch connection counts
+	ids := make([]int64, len(accounts))
+	for i, acc := range accounts {
+		ids[i] = acc.ID
+	}
+	connCounts := lb.connTracker.GetCounts(ids)
+
 	var bestAccounts []*store.Account
 	minScore := float64(-1)
 
@@ -157,10 +169,7 @@ func (lb *LoadBalancer) selectAccount(accounts []*store.Account) *store.Account 
 			weight = 1
 		}
 
-		var conns int64
-		if val, ok := lb.activeConns.Load(acc.ID); ok {
-			conns = val.(*atomic.Int64).Load()
-		}
+		conns := connCounts[acc.ID]
 		score := float64(conns) / float64(weight)
 
 		if bestAccounts == nil || score < minScore {
@@ -179,23 +188,11 @@ func (lb *LoadBalancer) selectAccount(accounts []*store.Account) *store.Account 
 }
 
 func (lb *LoadBalancer) AcquireConnection(accountID int64) {
-	val, _ := lb.activeConns.LoadOrStore(accountID, &atomic.Int64{})
-	val.(*atomic.Int64).Add(1)
+	lb.connTracker.Acquire(accountID)
 }
 
 func (lb *LoadBalancer) ReleaseConnection(accountID int64) {
-	if val, ok := lb.activeConns.Load(accountID); ok {
-		counter := val.(*atomic.Int64)
-		for {
-			current := counter.Load()
-			if current <= 0 {
-				break
-			}
-			if counter.CompareAndSwap(current, current-1) {
-				break
-			}
-		}
-	}
+	lb.connTracker.Release(accountID)
 }
 
 const (
@@ -203,6 +200,8 @@ const (
 	retry401Default = 5 * time.Minute
 	// 403/404 冷却时间：账号可能被封禁或配置错误，较长间隔后重试
 	retry403Default = 24 * time.Hour
+	// Grok 的 403 很多是 Cloudflare challenge/临时风控，不应长时间拉黑
+	retry403Grok = 10 * time.Minute
 )
 
 func (lb *LoadBalancer) isAccountAvailable(ctx context.Context, acc *store.Account) bool {
@@ -224,11 +223,16 @@ func (lb *LoadBalancer) isAccountAvailable(ctx context.Context, acc *store.Accou
 		}
 		return false
 	case "403", "404":
-		// 403/404 可能是临时封禁或配置问题，较长冷却后自动恢复
+		// 403/404 可能是临时封禁或配置问题。
+		// 对 Grok 来说，403 很多是 Cloudflare challenge，不应长时间拉黑。
 		if acc.LastAttempt.IsZero() {
 			return false
 		}
-		if now.Sub(acc.LastAttempt) >= retry403Default {
+		cooldown := retry403Default
+		if strings.EqualFold(acc.AccountType, "grok") {
+			cooldown = retry403Grok
+		}
+		if now.Sub(acc.LastAttempt) >= cooldown {
 			lb.clearAccountStatus(ctx, acc, status+" 冷却完成，自动恢复尝试")
 			return true
 		}

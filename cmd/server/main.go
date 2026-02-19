@@ -10,35 +10,28 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
 	"orchids-api/internal/api"
-	"orchids-api/internal/auth"
-	"orchids-api/internal/clerk"
+	"orchids-api/internal/audit"
 	"orchids-api/internal/config"
 	"orchids-api/internal/debug"
+	"orchids-api/internal/grok"
 	"orchids-api/internal/handler"
 	"orchids-api/internal/loadbalancer"
 	"orchids-api/internal/middleware"
-	"orchids-api/internal/orchids"
-	"orchids-api/internal/prompt"
+	"orchids-api/internal/provider"
 	"orchids-api/internal/store"
-	"orchids-api/internal/summarycache"
 	"orchids-api/internal/template"
 	"orchids-api/internal/tokencache"
-	"orchids-api/internal/warp"
-	"orchids-api/web"
-
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func main() {
 	configPath := flag.String("config", "", "Path to config.json/config.yaml")
 	flag.Parse()
 
-	cfg, resolvedCfgPath, err := config.Load(*configPath)
+	cfg, _, err := config.Load(*configPath)
 	if err != nil {
 		slog.New(slog.NewJSONHandler(os.Stdout, nil)).Error("Failed to load config", "error", err)
 		os.Exit(1)
@@ -83,57 +76,68 @@ func main() {
 			slog.Warn("Failed to load config from Redis, using file config", "error", err)
 		} else {
 			slog.Info("Config loaded from Redis")
-			// 重新应用默认值，防止 Redis 中缺少新增字段导致零值覆盖
 			config.ApplyDefaults(cfg)
-			// Enforce lower refresh interval if it's too high (legacy default was 30)
-			if cfg.TokenRefreshInterval > 5 {
-				slog.Info("Enforcing lower token refresh interval", "old", cfg.TokenRefreshInterval, "new", 1)
-				cfg.TokenRefreshInterval = 1
-			}
-			// Enforce higher request timeout (legacy default was 120)
-			if cfg.RequestTimeout < 300 {
-				slog.Info("Enforcing higher request timeout", "old", cfg.RequestTimeout, "new", 600)
-				cfg.RequestTimeout = 600
-			}
 		}
 	}
 
 	lb := loadbalancer.NewWithCacheTTL(s, time.Duration(cfg.LoadBalancerCacheTTL)*time.Second)
-	apiHandler := api.New(s, cfg.AdminUser, cfg.AdminPass, cfg, resolvedCfgPath)
-	h := handler.NewWithLoadBalancer(cfg, lb)
 
-	tokenCache := tokencache.NewMemoryCache(time.Duration(cfg.CacheTTL)*time.Minute, 10000)
+	// Connection tracker: use Redis when available
+	if redisClient := s.RedisClient(); redisClient != nil {
+		lb.SetConnTracker(loadbalancer.NewRedisConnTracker(redisClient, s.RedisPrefix()))
+		slog.Info("Connection tracker initialized", "backend", "redis")
+	}
+
+	apiHandler := api.New(s, cfg.AdminUser, cfg.AdminPass, cfg)
+	h := handler.NewWithLoadBalancer(cfg, lb)
+	grokHandler := grok.NewHandler(cfg, lb)
+
+	// Token cache: use Redis when available, fall back to memory
+	var tokenCache tokencache.Cache
+	if redisClient := s.RedisClient(); redisClient != nil {
+		tokenCache = tokencache.NewRedisCache(redisClient, s.RedisPrefix(), time.Duration(cfg.CacheTTL)*time.Minute)
+		slog.Info("Token cache initialized", "backend", "redis")
+	} else {
+		tokenCache = tokencache.NewMemoryCache(time.Duration(cfg.CacheTTL)*time.Minute, 10000)
+		slog.Info("Token cache initialized", "backend", "memory")
+	}
 	h.SetTokenCache(tokenCache)
 	apiHandler.SetTokenCache(tokenCache)
 
-	cacheMode := strings.ToLower(cfg.SummaryCacheMode)
-	if cacheMode != "off" {
-		stats := summarycache.NewStats()
-		h.SetSummaryStats(stats)
+	// Session store: use Redis when available, fall back to memory
+	if redisClient := s.RedisClient(); redisClient != nil {
+		sessionStore := handler.NewRedisSessionStore(redisClient, s.RedisPrefix(), 30*time.Minute)
+		h.SetSessionStore(sessionStore)
+		slog.Info("Session store initialized", "backend", "redis")
 
-		var baseCache prompt.SummaryCache
-		switch cacheMode {
-		case "redis":
-			baseCache = summarycache.NewRedisCache(
-				cfg.SummaryCacheRedisAddr,
-				cfg.SummaryCacheRedisPass,
-				cfg.SummaryCacheRedisDB,
-				time.Duration(cfg.SummaryCacheTTLSeconds)*time.Second,
-				cfg.SummaryCacheRedisPrefix,
-			)
-		default:
-			if cfg.SummaryCacheSize > 0 {
-				baseCache = summarycache.NewMemoryCache(cfg.SummaryCacheSize, time.Duration(cfg.SummaryCacheTTLSeconds)*time.Second)
+		dedupStore := handler.NewRedisDedupStore(redisClient, s.RedisPrefix(), 2*time.Second)
+		h.SetDedupStore(dedupStore)
+		slog.Info("Dedup store initialized", "backend", "redis")
+
+		auditLogger := audit.NewRedisLogger(redisClient, s.RedisPrefix(), 10000)
+		h.SetAuditLogger(auditLogger)
+		defer auditLogger.Close()
+		slog.Info("Audit logger initialized", "backend", "redis")
+	}
+
+	// Provider registry for decoupled client creation
+	registry := provider.NewRegistry()
+	registry.Register("orchids", provider.NewOrchidsProvider())
+	registry.Register("warp", provider.NewWarpProvider())
+	h.SetClientFactory(func(acc *store.Account, c *config.Config) handler.UpstreamClient {
+		if p := registry.Get(acc.AccountType); p != nil {
+			if client, ok := p.NewClient(acc, c).(handler.UpstreamClient); ok {
+				return client
 			}
 		}
-
-		if baseCache != nil {
-			instrumented := summarycache.NewInstrumentedCache(baseCache, stats)
-			h.SetSummaryCache(instrumented)
-			apiHandler.SetSummaryCache(instrumented)
+		// Fallback to orchids
+		if p := registry.Get("orchids"); p != nil {
+			if client, ok := p.NewClient(acc, c).(handler.UpstreamClient); ok {
+				return client
+			}
 		}
-	}
-	slog.Info("Summary cache mode", "mode", cacheMode)
+		return nil
+	})
 
 	// Initialize template renderer
 	tmplRenderer, err := template.NewRenderer()
@@ -143,105 +147,16 @@ func main() {
 	}
 	slog.Info("Template renderer initialized")
 
+	// Register routes
 	mux := http.NewServeMux()
-
 	limiter := middleware.NewConcurrencyLimiter(cfg.ConcurrencyLimit, time.Duration(cfg.ConcurrencyTimeout)*time.Second, cfg.AdaptiveTimeout)
-	mux.HandleFunc("/orchids/v1/messages", limiter.Limit(h.HandleMessages))
-	mux.HandleFunc("/orchids/v1/messages/count_tokens", limiter.Limit(h.HandleCountTokens))
-	mux.HandleFunc("/warp/v1/messages", limiter.Limit(h.HandleMessages))
-	mux.HandleFunc("/warp/v1/messages/count_tokens", limiter.Limit(h.HandleCountTokens))
-	// Public Model Routes (Orchids & Warp separate channels)
-	mux.HandleFunc("/orchids/v1/models", h.HandleModels)
-	mux.HandleFunc("/orchids/v1/models/", h.HandleModelByID)
-	mux.HandleFunc("/warp/v1/models", h.HandleModels)
-	mux.HandleFunc("/warp/v1/models/", h.HandleModelByID)
-	// Unified Model Routes (All channels)
-	mux.HandleFunc("/v1/models", h.HandleModels)
-	mux.HandleFunc("/v1/models/", h.HandleModelByID)
+	registerRoutes(mux, cfg, s, h, grokHandler, apiHandler, limiter, tmplRenderer)
 
-	// OpenAI Compatibility - Channel Specific
-	mux.HandleFunc("/orchids/v1/chat/completions", limiter.Limit(h.HandleMessages))
-	mux.HandleFunc("/warp/v1/chat/completions", limiter.Limit(h.HandleMessages))
-
-	// Public routes
-	mux.HandleFunc("/api/login", apiHandler.HandleLogin)
-	mux.HandleFunc("/api/logout", apiHandler.HandleLogout)
-
-	// Admin API with session auth
-	mux.HandleFunc("/api/accounts", middleware.SessionAuth(cfg.AdminPass, cfg.AdminToken, apiHandler.HandleAccounts))
-	mux.HandleFunc("/api/accounts/", middleware.SessionAuth(cfg.AdminPass, cfg.AdminToken, apiHandler.HandleAccountByID))
-	mux.HandleFunc("/api/keys", middleware.SessionAuth(cfg.AdminPass, cfg.AdminToken, apiHandler.HandleKeys))
-	mux.HandleFunc("/api/keys/", middleware.SessionAuth(cfg.AdminPass, cfg.AdminToken, apiHandler.HandleKeyByID))
-	mux.HandleFunc("/api/models", middleware.SessionAuth(cfg.AdminPass, cfg.AdminToken, apiHandler.HandleModels))
-	mux.HandleFunc("/api/models/", middleware.SessionAuth(cfg.AdminPass, cfg.AdminToken, apiHandler.HandleModelByID))
-	mux.HandleFunc("/api/export", middleware.SessionAuth(cfg.AdminPass, cfg.AdminToken, apiHandler.HandleExport))
-	mux.HandleFunc("/api/import", middleware.SessionAuth(cfg.AdminPass, cfg.AdminToken, apiHandler.HandleImport))
-	mux.HandleFunc("/api/config", middleware.SessionAuth(cfg.AdminPass, cfg.AdminToken, apiHandler.HandleConfig))
-	mux.HandleFunc("/api/config/cache/stats", middleware.SessionAuth(cfg.AdminPass, cfg.AdminToken, apiHandler.HandleCacheStats))
-	mux.HandleFunc("/api/config/cache/clear", middleware.SessionAuth(cfg.AdminPass, cfg.AdminToken, apiHandler.HandleCacheClear))
-
-	// Protected Web UI
-	staticHandler := http.StripPrefix(cfg.AdminPath, web.StaticHandler())
-	mux.HandleFunc(cfg.AdminPath+"/", func(w http.ResponseWriter, r *http.Request) {
-		// Serve login page (static)
-		if r.URL.Path == cfg.AdminPath+"/login.html" {
-			staticHandler.ServeHTTP(w, r)
-			return
-		}
-
-		// Serve static assets (CSS, JS)
-		if strings.HasPrefix(r.URL.Path, cfg.AdminPath+"/css/") ||
-			strings.HasPrefix(r.URL.Path, cfg.AdminPath+"/js/") {
-			staticHandler.ServeHTTP(w, r)
-			return
-		}
-
-		// Authentication check
-		cookie, err := r.Cookie("session_token")
-		authenticated := err == nil && auth.ValidateSessionToken(cookie.Value)
-
-		if !authenticated {
-			adminToken := cfg.AdminToken
-			authHeader := r.Header.Get("Authorization")
-			authenticated = adminToken != "" && (authHeader == "Bearer "+adminToken || authHeader == adminToken || r.Header.Get("X-Admin-Token") == adminToken)
-		}
-
-		if !authenticated {
-			http.Redirect(w, r, cfg.AdminPath+"/login.html", http.StatusFound)
-			return
-		}
-
-		// Render template-based index page
-		if r.URL.Path == cfg.AdminPath+"/" || r.URL.Path == cfg.AdminPath {
-			err := tmplRenderer.RenderIndex(w, r, cfg, s)
-			if err != nil {
-				slog.Error("Failed to render template", "error", err)
-				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-			}
-			return
-		}
-
-		// Fallback to static handler for other files
-		staticHandler.ServeHTTP(w, r)
-	})
-
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"status":"ok"}`))
-	})
-
-	// Prometheus metrics endpoint
-	mux.Handle("/metrics", promhttp.Handler())
-	slog.Info("Prometheus metrics enabled", "path", "/metrics")
-
-	if cfg.DebugEnabled {
-		mux.HandleFunc("/debug/pprof/", middleware.SessionAuth(cfg.AdminPass, cfg.AdminToken, http.DefaultServeMux.ServeHTTP))
-		slog.Info("pprof enabled", "path", "/debug/pprof/")
-	}
-
+	// Build server
 	server := &http.Server{
 		Addr: ":" + cfg.Port,
 		Handler: middleware.Chain(
+			middleware.SecurityHeaders,
 			middleware.TraceMiddleware,
 			middleware.LoggingMiddleware,
 		)(mux),
@@ -250,348 +165,15 @@ func main() {
 		IdleTimeout:       60 * time.Second,
 	}
 
-	// Create context for background goroutines
+	// Start background tasks
 	ctx, cancelBackground := context.WithCancel(context.Background())
 	defer cancelBackground()
 
-	if cfg.AutoRefreshToken {
-		interval := time.Duration(cfg.TokenRefreshInterval) * time.Minute
-		if interval <= 0 {
-			interval = 30 * time.Minute
-		}
-		slog.Info("Auto refresh token enabled", "interval", interval.String())
+	startTokenRefreshLoop(ctx, cfg, s, lb)
+	startAuthCleanupLoop(ctx)
+	startModelSyncLoop(ctx, cfg, s)
 
-		refreshAccounts := func() {
-			accounts, err := s.GetEnabledAccounts(context.Background())
-			if err != nil {
-				slog.Error("Auto refresh token: list accounts failed", "error", err)
-				return
-			}
-			for _, acc := range accounts {
-				if strings.EqualFold(acc.AccountType, "warp") {
-					if !acc.QuotaResetAt.IsZero() && time.Now().Before(acc.QuotaResetAt) {
-						continue
-					}
-					if strings.TrimSpace(acc.RefreshToken) == "" && strings.TrimSpace(acc.ClientCookie) == "" {
-						continue
-					}
-					warpClient := warp.NewFromAccount(acc, cfg)
-					jwt, err := warpClient.RefreshAccount(context.Background())
-					if err != nil {
-						retryAfter := warp.RetryAfter(err)
-						httpStatus := warp.HTTPStatusCode(err)
-						// 标记 401/403 账号状态
-						if httpStatus == 401 || httpStatus == 403 {
-							lb.MarkAccountStatus(context.Background(), acc, fmt.Sprintf("%d", httpStatus))
-						} else if retryAfter > 0 {
-							// 429 等限流错误，只记录 QuotaResetAt
-							acc.QuotaResetAt = time.Now().Add(retryAfter)
-							if updateErr := s.UpdateAccount(context.Background(), acc); updateErr != nil {
-								slog.Warn("Auto refresh token: record warp retry-after failed", "account", acc.Name, "type", "warp", "error", updateErr)
-							}
-						}
-						slog.Warn("Auto refresh token failed", "account", acc.Name, "type", "warp", "http_status", httpStatus, "error", err)
-						continue
-					}
-					if jwt != "" {
-						acc.Token = jwt
-					}
-					warpClient.SyncAccountState()
-
-					// Sync Warp usage quota via GraphQL
-					limitCtx, limitCancel := context.WithTimeout(context.Background(), 15*time.Second)
-					limitInfo, bonuses, limitErr := warpClient.GetRequestLimitInfo(limitCtx)
-					limitCancel()
-					if limitErr != nil {
-						slog.Warn("Warp usage sync failed", "account", acc.Name, "error", limitErr)
-					} else if limitInfo != nil {
-						if limitInfo.IsUnlimited {
-							acc.Subscription = "unlimited"
-						} else {
-							acc.Subscription = "free"
-						}
-						totalLimit := float64(limitInfo.RequestLimit)
-						for _, bg := range bonuses {
-							totalLimit += float64(bg.RequestCreditsRemaining)
-						}
-						usedRequests := float64(limitInfo.RequestsUsedSinceLastRefresh)
-						acc.UsageLimit = totalLimit
-						// Warp: UsageCurrent 语义为“已使用请求数”
-						acc.UsageCurrent = usedRequests
-						if limitInfo.NextRefreshTime != "" {
-							if t, err := time.Parse(time.RFC3339, limitInfo.NextRefreshTime); err == nil {
-								acc.QuotaResetAt = t
-							}
-						}
-						slog.Debug("Warp usage synced", "account", acc.Name, "limit", acc.UsageLimit, "used", acc.UsageCurrent, "subscription", acc.Subscription)
-					}
-
-					if err := s.UpdateAccount(context.Background(), acc); err != nil {
-						slog.Warn("Auto refresh token: update account failed", "account", acc.Name, "type", "warp", "error", err)
-					}
-					continue
-				}
-				if strings.TrimSpace(acc.ClientCookie) == "" {
-					continue
-				}
-				info, err := clerk.FetchAccountInfo(acc.ClientCookie)
-				if err != nil {
-					errLower := strings.ToLower(err.Error())
-					switch {
-					case strings.Contains(errLower, "status code 401") || strings.Contains(errLower, "unauthorized"):
-						lb.MarkAccountStatus(context.Background(), acc, "401")
-					case strings.Contains(errLower, "status code 403") || strings.Contains(errLower, "forbidden"):
-						lb.MarkAccountStatus(context.Background(), acc, "403")
-					case strings.Contains(errLower, "no active sessions"):
-						lb.MarkAccountStatus(context.Background(), acc, "401")
-					}
-					slog.Warn("Auto refresh token failed", "account", acc.Name, "error", err)
-					continue
-				}
-				if info.SessionID != "" {
-					acc.SessionID = info.SessionID
-				}
-				if info.ClientUat != "" {
-					acc.ClientUat = info.ClientUat
-				}
-				if info.ProjectID != "" {
-					acc.ProjectID = info.ProjectID
-				}
-				if info.UserID != "" {
-					acc.UserID = info.UserID
-				}
-				if info.Email != "" {
-					acc.Email = info.Email
-				}
-				if info.JWT != "" {
-					acc.Token = info.JWT
-				}
-				if info.ClientCookie != "" {
-					acc.ClientCookie = info.ClientCookie
-				}
-
-				if err := s.UpdateAccount(context.Background(), acc); err != nil {
-					slog.Warn("Auto refresh token: update account failed", "account", acc.Name, "error", err)
-					continue
-				}
-			}
-		}
-
-		go func() {
-			defer func() {
-				if err := recover(); err != nil {
-					slog.Error("Panic in token refresh loop", "error", err)
-				}
-			}()
-			refreshAccounts()
-			ticker := time.NewTicker(interval)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-					refreshAccounts()
-				}
-			}
-		}()
-	}
-
-	go func() {
-		defer func() {
-			if err := recover(); err != nil {
-				slog.Error("Panic in auth cleanup loop", "error", err)
-			}
-		}()
-		ticker := time.NewTicker(time.Hour)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				auth.CleanupExpiredSessions()
-			}
-		}
-	}()
-
-	// 上游模型同步
-	go func() {
-		defer func() {
-			if err := recover(); err != nil {
-				slog.Error("Panic in upstream model sync loop", "error", err)
-			}
-		}()
-
-		syncModels := func() {
-			accounts, err := s.GetEnabledAccounts(context.Background())
-			if err != nil {
-				slog.Warn("上游模型同步: 获取账号失败", "error", err)
-				return
-			}
-			// 找到第一个可用的 Orchids 账号来获取上游模型
-			var client *orchids.Client
-			hasOrchidsAccount := false
-			for _, acc := range accounts {
-				if strings.EqualFold(acc.AccountType, "warp") {
-					continue
-				}
-				hasOrchidsAccount = true
-				client = orchids.NewFromAccount(acc, cfg)
-				break
-			}
-			if client == nil {
-				if !hasOrchidsAccount {
-					slog.Debug("上游模型同步: 无 Orchids 账号，跳过")
-					return
-				}
-				// 兜底：存在 Orchids 账号但构造失败时仍尝试默认配置
-				client = orchids.New(cfg)
-			}
-
-			fetchCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-
-			upstreamModels, err := client.FetchUpstreamModels(fetchCtx)
-			if err != nil {
-				slog.Warn("上游模型同步: 获取失败", "error", err)
-				return
-			}
-			if len(upstreamModels) == 0 {
-				slog.Debug("上游模型同步: 无模型返回")
-				return
-			}
-
-			added := 0
-			for _, um := range upstreamModels {
-				modelID := strings.TrimSpace(um.ID)
-				if modelID == "" {
-					continue
-				}
-				// 检查本地是否已存在
-				if _, err := s.GetModelByModelID(context.Background(), modelID); err == nil {
-					continue
-				}
-				// 新模型，添加到 store
-				channel := "Orchids"
-				if strings.TrimSpace(um.OwnedBy) != "" {
-					channel = um.OwnedBy
-				}
-				newModel := &store.Model{
-					Channel: channel,
-					ModelID: modelID,
-					Name:    modelID,
-					Status:  store.ModelStatusAvailable,
-				}
-				if err := s.CreateModel(context.Background(), newModel); err != nil {
-					slog.Warn("上游模型同步: 创建模型失败", "model_id", modelID, "error", err)
-					continue
-				}
-				added++
-				slog.Info("上游模型同步: 新增模型", "model_id", modelID, "channel", channel)
-			}
-			if added > 0 {
-				slog.Info("上游模型同步完成", "total_upstream", len(upstreamModels), "added", added)
-			} else {
-				slog.Debug("上游模型同步完成，无新增", "total_upstream", len(upstreamModels))
-			}
-		}
-
-		syncWarpModels := func() {
-			accounts, err := s.GetEnabledAccounts(context.Background())
-			if err != nil {
-				slog.Warn("Warp 模型同步: 获取账号失败", "error", err)
-				return
-			}
-			// 找到第一个可用的 Warp 账号
-			var warpAcc *store.Account
-			for _, acc := range accounts {
-				if strings.EqualFold(acc.AccountType, "warp") && strings.TrimSpace(acc.Token) != "" {
-					warpAcc = acc
-					break
-				}
-			}
-			if warpAcc == nil {
-				slog.Debug("Warp 模型同步: 无可用 Warp 账号")
-				return
-			}
-
-			warpClient := warp.NewFromAccount(warpAcc, cfg)
-			fetchCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-
-			choices, err := warpClient.GetFeatureModelChoices(fetchCtx)
-			if err != nil {
-				slog.Warn("Warp 模型同步: 获取失败", "error", err)
-				return
-			}
-
-			// Collect all unique models from all categories
-			seen := make(map[string]bool)
-			added := 0
-			categories := []*warp.FeatureModelCategory{choices.AgentMode, choices.Planning, choices.Coding, choices.CliAgent}
-			for _, cat := range categories {
-				if cat == nil {
-					continue
-				}
-				for _, choice := range cat.Choices {
-					modelID := strings.TrimSpace(choice.ID)
-					if modelID == "" || seen[modelID] {
-						continue
-					}
-					seen[modelID] = true
-					// Check if model already exists
-					if _, err := s.GetModelByModelID(context.Background(), modelID); err == nil {
-						continue
-					}
-					displayName := choice.DisplayName
-					if displayName == "" {
-						displayName = modelID
-					}
-					newModel := &store.Model{
-						Channel: "Warp",
-						ModelID: modelID,
-						Name:    displayName + " (Warp)",
-						Status:  store.ModelStatusAvailable,
-					}
-					if err := s.CreateModel(context.Background(), newModel); err != nil {
-						slog.Warn("Warp 模型同步: 创建模型失败", "model_id", modelID, "error", err)
-						continue
-					}
-					added++
-					slog.Info("Warp 模型同步: 新增模型", "model_id", modelID, "name", displayName)
-				}
-			}
-			if added > 0 {
-				slog.Info("Warp 模型同步完成", "added", added)
-			} else {
-				slog.Debug("Warp 模型同步完成，无新增")
-			}
-		}
-
-		// 启动时延迟 10 秒执行，等待 token 刷新完成
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(10 * time.Second):
-		}
-		syncModels()
-		syncWarpModels()
-
-		ticker := time.NewTicker(30 * time.Minute)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				syncModels()
-				syncWarpModels()
-			}
-		}
-	}()
-
-	// 优雅关闭处理
+	// Graceful shutdown
 	idleConnsClosed := make(chan struct{})
 	go func() {
 		quit := make(chan os.Signal, 1)
@@ -599,10 +181,8 @@ func main() {
 		sig := <-quit
 		slog.Info("Received signal, starting graceful shutdown", "signal", sig)
 
-		// Stop background goroutines first
 		cancelBackground()
 
-		// Give existing requests time to complete
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 
