@@ -1,9 +1,10 @@
 package warp
 
 import (
+	"bytes"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
+	"github.com/goccy/go-json"
 	"html"
 	"strings"
 	"time"
@@ -89,7 +90,7 @@ func encodeVarint(value int) []byte {
 		return []byte{0}
 	}
 	x := uint64(value)
-	var out []byte
+	out := make([]byte, 0, 10) // varint max 10 bytes
 	for x >= 0x80 {
 		out = append(out, byte(x)|0x80)
 		x >>= 7
@@ -103,6 +104,7 @@ func buildRequestBytes(promptText, model string, messages []prompt.Message, mcpC
 	if err != nil {
 		return nil, err
 	}
+	normalizedModel := normalizeModel(model)
 
 	fullQuery, isNew := buildWarpQuery(userText, history, toolResults, disableWarpTools)
 	if fullQuery == "" {
@@ -120,7 +122,7 @@ func buildRequestBytes(promptText, model string, messages []prompt.Message, mcpC
 	// 注意：在 task_context 中注入 conversationID 会触发 Warp 400
 	// (invalid AIAgentRequest: cannot parse invalid wire-format data)。
 	// 当前保持空 task_context，依赖历史拼接延续上下文。
-	reqBytes, err := buildRequestBytesFromTemplate(fullQuery, isNew, disableWarpTools, workdir)
+	reqBytes, err := buildRequestBytesFromTemplate(fullQuery, normalizedModel, isNew, disableWarpTools, workdir)
 	if err != nil {
 		return nil, err
 	}
@@ -328,10 +330,7 @@ func toolResultDedupKey(result warpToolResult) string {
 
 func shouldDedupToolResultByContent(content string) bool {
 	lower := strings.ToLower(content)
-	if strings.Contains(lower, "eoferror: eof when reading a line") {
-		return true
-	}
-	return false
+	return strings.Contains(lower, "eoferror: eof when reading a line")
 }
 
 func isBenignNoopShellError(lower string) bool {
@@ -490,7 +489,7 @@ func formatWarpHistory(history []warpHistoryMessage) []string {
 	return parts
 }
 
-func buildRequestBytesFromTemplate(userText string, isNew bool, disableWarpTools bool, workdir string) ([]byte, error) {
+func buildRequestBytesFromTemplate(userText, model string, isNew bool, disableWarpTools bool, workdir string) ([]byte, error) {
 	template := append([]byte(nil), realRequestTemplate...)
 
 	newQueryBytes := []byte(userText)
@@ -531,11 +530,95 @@ func buildRequestBytesFromTemplate(userText string, isNew bool, disableWarpTools
 	// 模板开头保留空 task_context: 0a 00
 	result := append([]byte{0x0a, 0x00}, newInputMsg...)
 	result = append(result, rest...)
+	result = patchTemplateModel(result, model)
 
 	if disableWarpTools {
 		result = removeSupportedTools(result)
 	}
 	return result, nil
+}
+
+// patchTemplateModel rewrites the model entry in the static Warp protobuf template.
+// The template currently stores one model slot as:
+// 0a <entry_len> 0a <model_len> <model> 22 <id_len> <identifier>
+// and is wrapped by a settings field:
+// 1a <settings_len> ...
+// We patch model bytes and adjust the two enclosing single-byte lengths.
+func patchTemplateModel(data []byte, model string) []byte {
+	target := strings.TrimSpace(model)
+	if target == "" {
+		target = defaultModel
+	}
+	modelBytes := []byte(target)
+	if len(modelBytes) == 0 || len(modelBytes) > 0x7f {
+		return data
+	}
+
+	idBytes := []byte(identifier)
+	idPos := findBytes(data, idBytes)
+	if idPos < 2 || data[idPos-2] != 0x22 {
+		return data
+	}
+	idLen := int(data[idPos-1])
+	if idLen != len(idBytes) {
+		return data
+	}
+
+	modelTagPos := -1
+	oldModelLen := 0
+	for i := idPos - 3; i >= 0 && i >= idPos-96; i-- {
+		if data[i] != 0x0a || i+1 >= len(data) {
+			continue
+		}
+		l := int(data[i+1])
+		if i+2+l == idPos-2 {
+			modelTagPos = i
+			oldModelLen = l
+			break
+		}
+	}
+	if modelTagPos < 0 {
+		return data
+	}
+
+	entryTagPos := modelTagPos - 2
+	if entryTagPos < 0 || data[entryTagPos] != 0x0a {
+		return data
+	}
+	settingsTagPos := entryTagPos - 2
+	if settingsTagPos < 0 || data[settingsTagPos] != 0x1a {
+		return data
+	}
+
+	oldEntryLen := int(data[entryTagPos+1])
+	expectedEntryLen := idPos + idLen - modelTagPos
+	if oldEntryLen != expectedEntryLen {
+		return data
+	}
+
+	oldSettingsLen := int(data[settingsTagPos+1])
+	delta := len(modelBytes) - oldModelLen
+	newEntryLen := oldEntryLen + delta
+	newSettingsLen := oldSettingsLen + delta
+	if newEntryLen < 0 || newEntryLen > 0x7f || newSettingsLen < 0 || newSettingsLen > 0x7f {
+		return data
+	}
+
+	modelStart := modelTagPos + 2
+	modelEnd := modelStart + oldModelLen
+	if modelEnd > len(data) {
+		return data
+	}
+
+	out := make([]byte, 0, len(data)+delta)
+	out = append(out, data[:modelStart]...)
+	out = append(out, modelBytes...)
+	out = append(out, data[modelEnd:]...)
+
+	out[modelTagPos+1] = byte(len(modelBytes))
+	out[entryTagPos+1] = byte(newEntryLen)
+	out[settingsTagPos+1] = byte(newSettingsLen)
+	return out
 }
 
 func removeSupportedTools(data []byte) []byte {
@@ -612,12 +695,7 @@ func findBytes(haystack, needle []byte) int {
 	if len(needle) == 0 {
 		return -1
 	}
-	for i := 0; i+len(needle) <= len(haystack); i++ {
-		if string(haystack[i:i+len(needle)]) == string(needle) {
-			return i
-		}
-	}
-	return -1
+	return bytes.Index(haystack, needle)
 }
 
 func encodeBytesField(field int, value []byte) []byte {
@@ -693,11 +771,18 @@ type toolDef struct {
 	Schema      map[string]interface{}
 }
 
+const (
+	maxWarpToolCount         = 24
+	maxWarpToolDescLen       = 512
+	maxWarpToolSchemaJSONLen = 4096
+)
+
 func convertTools(tools []interface{}) []toolDef {
 	if len(tools) == 0 {
 		return nil
 	}
 	defs := make([]toolDef, 0, len(tools))
+	seen := make(map[string]struct{})
 	for _, raw := range tools {
 		m, ok := raw.(map[string]interface{})
 		if !ok {
@@ -711,9 +796,20 @@ func convertTools(tools []interface{}) []toolDef {
 				}
 				name = orchids.NormalizeToolName(name)
 				description, _ := fn["description"].(string)
-				schema := schemaMap(fn["parameters"])
+				schema := compactWarpSchema(schemaMap(fn["parameters"]))
 				if name != "" {
-					defs = append(defs, toolDef{Name: name, Description: description, Schema: schema})
+					key := strings.ToLower(strings.TrimSpace(name))
+					if key == "" {
+						continue
+					}
+					if _, exists := seen[key]; exists {
+						continue
+					}
+					seen[key] = struct{}{}
+					defs = append(defs, toolDef{Name: name, Description: compactWarpDescription(description), Schema: schema})
+					if len(defs) >= maxWarpToolCount {
+						break
+					}
 				}
 				continue
 			}
@@ -728,8 +824,20 @@ func convertTools(tools []interface{}) []toolDef {
 		if schema == nil {
 			schema = schemaMap(m["parameters"])
 		}
+		schema = compactWarpSchema(schema)
 		if name != "" {
-			defs = append(defs, toolDef{Name: name, Description: description, Schema: schema})
+			key := strings.ToLower(strings.TrimSpace(name))
+			if key == "" {
+				continue
+			}
+			if _, exists := seen[key]; exists {
+				continue
+			}
+			seen[key] = struct{}{}
+			defs = append(defs, toolDef{Name: name, Description: compactWarpDescription(description), Schema: schema})
+			if len(defs) >= maxWarpToolCount {
+				break
+			}
 		}
 	}
 	return defs
@@ -745,107 +853,180 @@ func schemaMap(v interface{}) map[string]interface{} {
 	return nil
 }
 
+func compactWarpDescription(description string) string {
+	description = strings.TrimSpace(description)
+	if description == "" {
+		return ""
+	}
+	runes := []rune(description)
+	if len(runes) <= maxWarpToolDescLen {
+		return description
+	}
+	return string(runes[:maxWarpToolDescLen]) + "...[truncated]"
+}
+
+func compactWarpSchema(schema map[string]interface{}) map[string]interface{} {
+	if schema == nil {
+		return nil
+	}
+	cleaned := cleanWarpSchema(schema)
+	if cleaned == nil {
+		return nil
+	}
+	if warpSchemaJSONLen(cleaned) <= maxWarpToolSchemaJSONLen {
+		return cleaned
+	}
+	stripped := stripWarpSchemaDescriptions(cleaned)
+	if warpSchemaJSONLen(stripped) <= maxWarpToolSchemaJSONLen {
+		return stripped
+	}
+	return map[string]interface{}{
+		"type":       "object",
+		"properties": map[string]interface{}{},
+	}
+}
+
+func cleanWarpSchema(schema map[string]interface{}) map[string]interface{} {
+	if schema == nil {
+		return nil
+	}
+	sanitized := map[string]interface{}{}
+	for _, key := range []string{"type", "description", "properties", "required", "enum", "items"} {
+		if v, ok := schema[key]; ok {
+			sanitized[key] = v
+		}
+	}
+	if props, ok := sanitized["properties"].(map[string]interface{}); ok {
+		cleanProps := map[string]interface{}{}
+		for name, prop := range props {
+			cleanProps[name] = cleanWarpSchemaValue(prop)
+		}
+		sanitized["properties"] = cleanProps
+	}
+	if items, ok := sanitized["items"]; ok {
+		sanitized["items"] = cleanWarpSchemaValue(items)
+	}
+	return sanitized
+}
+
+func cleanWarpSchemaValue(value interface{}) interface{} {
+	switch v := value.(type) {
+	case map[string]interface{}:
+		return cleanWarpSchema(v)
+	case []interface{}:
+		out := make([]interface{}, 0, len(v))
+		for _, item := range v {
+			out = append(out, cleanWarpSchemaValue(item))
+		}
+		return out
+	default:
+		return value
+	}
+}
+
+func stripWarpSchemaDescriptions(schema map[string]interface{}) map[string]interface{} {
+	if schema == nil {
+		return nil
+	}
+	out := make(map[string]interface{}, len(schema))
+	for k, v := range schema {
+		if strings.EqualFold(k, "description") || strings.EqualFold(k, "title") {
+			continue
+		}
+		out[k] = stripWarpSchemaDescriptionsValue(v)
+	}
+	return out
+}
+
+func stripWarpSchemaDescriptionsValue(value interface{}) interface{} {
+	switch v := value.(type) {
+	case map[string]interface{}:
+		return stripWarpSchemaDescriptions(v)
+	case []interface{}:
+		out := make([]interface{}, 0, len(v))
+		for _, item := range v {
+			out = append(out, stripWarpSchemaDescriptionsValue(item))
+		}
+		return out
+	default:
+		return value
+	}
+}
+
+func warpSchemaJSONLen(schema map[string]interface{}) int {
+	if schema == nil {
+		return 0
+	}
+	raw, err := json.Marshal(schema)
+	if err != nil {
+		return 0
+	}
+	return len(raw)
+}
+
 func normalizeModel(model string) string {
-	model = strings.ToLower(strings.TrimSpace(model))
-	if model == "" {
+	normalized := normalizeWarpModelKey(model)
+	if normalized == "" {
 		return defaultModel
 	}
+	if mapped, ok := warpModelMap[normalized]; ok {
+		return mapped
+	}
+	return defaultModel
+}
 
-	known := map[string]struct{}{
-		"auto":                       {},
-		"auto-efficient":             {},
-		"auto-genius":                {},
-		"warp-basic":                 {},
-		"claude-4-sonnet":            {},
-		"claude-4-5-sonnet":          {},
-		"claude-4-5-sonnet-thinking": {},
-		"claude-4-5-opus":            {},
-		"claude-4-5-opus-thinking":   {},
-		"claude-4-6-opus-high":       {},
-		"claude-4-6-opus-max":        {},
-		"claude-4-5-haiku":           {},
-		"claude-4-opus":              {},
-		"claude-4.1-opus":            {},
-		"gpt-5":                      {},
-		"gpt-5-low":                  {},
-		"gpt-5-medium":               {},
-		"gpt-5-high":                 {},
-		"gpt-5-1-low":                {},
-		"gpt-5-1-medium":             {},
-		"gpt-5-1-high":               {},
-		"gpt-5-1-codex-low":          {},
-		"gpt-5-1-codex-medium":       {},
-		"gpt-5-1-codex-high":         {},
-		"gpt-5-1-codex-max-low":      {},
-		"gpt-4o":                     {},
-		"gpt-4.1":                    {},
-		"o3":                         {},
-		"o4-mini":                    {},
-		"gemini-2-5-pro":             {},
-		"gemini-2.5-pro":             {},
-		"gemini-3-pro":               {},
+// ResolveModelAlias maps a user-facing model ID to a Warp upstream model ID.
+// Returns empty string if no known mapping exists.
+func ResolveModelAlias(model string) string {
+	normalized := normalizeWarpModelKey(model)
+	if normalized == "" {
+		return ""
 	}
-	if _, ok := known[model]; ok {
-		return model
+	if mapped, ok := warpModelMap[normalized]; ok {
+		return mapped
 	}
+	return ""
+}
 
-	if strings.Contains(model, "sonnet-4-5") || strings.Contains(model, "sonnet 4.5") {
-		if strings.Contains(model, "thinking") {
-			return "claude-4-5-sonnet-thinking"
-		}
-		return "claude-4-5-sonnet"
-	}
-	if strings.Contains(model, "opus-4-6") || strings.Contains(model, "opus 4.6") {
-		if strings.Contains(model, "max") {
-			return "claude-4-6-opus-max"
-		}
-		return "claude-4-6-opus-high"
-	}
-	if strings.Contains(model, "opus-4-5") || strings.Contains(model, "opus 4.5") {
-		if strings.Contains(model, "thinking") {
-			return "claude-4-5-opus-thinking"
-		}
-		return "claude-4-5-opus"
-	}
-	if strings.Contains(model, "haiku-4-5") || strings.Contains(model, "haiku 4.5") {
-		return "claude-4-5-haiku"
-	}
-	if strings.Contains(model, "sonnet-4") {
-		return "claude-4-sonnet"
-	}
-	if strings.Contains(model, "opus-4") || strings.Contains(model, "opus 4") {
-		return "claude-4-opus"
-	}
+var modelKeyReplacements = [][2]string{
+	{"4.6", "4-6"}, {"4.5", "4-5"}, {"2.5", "2-5"},
+	{"5.1", "5-1"}, {"5.2", "5-2"},
+}
 
-	// Gemini 模糊匹配
-	if strings.Contains(model, "gemini-3") || strings.Contains(model, "gemini 3") {
-		return "gemini-3-pro"
+func normalizeWarpModelKey(model string) string {
+	normalized := strings.ToLower(strings.TrimSpace(model))
+	if normalized == "" {
+		return ""
 	}
-	if strings.Contains(model, "gemini-2-5") || strings.Contains(model, "gemini-2.5") || strings.Contains(model, "gemini 2.5") {
-		return "gemini-2-5-pro"
+	for _, r := range modelKeyReplacements {
+		normalized = strings.ReplaceAll(normalized, r[0], r[1])
 	}
+	return normalized
+}
 
-	// GPT-5.1 Codex Max 模糊匹配
-	if strings.Contains(model, "gpt-5-1-codex-max") || strings.Contains(model, "gpt-5.1-codex-max") {
-		return "gpt-5-1-codex-max-low"
-	}
-
-	// Haiku / Sonnet / Opus 通配
-	if strings.Contains(model, "haiku") {
-		return "claude-4-5-haiku"
-	}
-	if strings.Contains(model, "sonnet") {
-		if strings.Contains(model, "thinking") {
-			return "claude-4-5-sonnet-thinking"
-		}
-		return "claude-4-5-sonnet"
-	}
-	if strings.Contains(model, "opus") {
-		if strings.Contains(model, "thinking") {
-			return "claude-4-5-opus-thinking"
-		}
-		return "claude-4-5-opus"
-	}
-
-	return "auto"
+var warpModelMap = map[string]string{
+	"claude-4-sonnet":            "claude-4-sonnet",
+	"claude-4-5-sonnet":          "claude-4-5-sonnet",
+	"claude-4-5-sonnet-thinking": "claude-4-5-sonnet-thinking",
+	"claude-4-6-sonnet":          "claude-4-6-sonnet-high",
+	"claude-sonnet-4-6":          "claude-4-6-sonnet-high",
+	"claude-4-6-opus-high":       "claude-4-6-opus-high",
+	"claude-4-6-opus-max":        "claude-4-6-opus-max",
+	"claude-4-6-sonnet-high":     "claude-4-6-sonnet-high",
+	"claude-4-6-sonnet-max":      "claude-4-6-sonnet-max",
+	"claude-4-6-opus":            "claude-4-6-opus-high",
+	"claude-opus-4-6":            "claude-4-6-opus-high",
+	"claude-4-5-opus-thinking":   "claude-4-5-opus-thinking",
+	"gemini-2-5-pro":             "gemini-2-5-pro",
+	"gemini-3-pro":               "gemini-3-pro",
+	"claude-4-5-haiku":           "claude-4-5-haiku",
+	"claude-4-5-opus":            "claude-4-5-opus",
+	"gpt-5-1-codex-low":          "gpt-5-1-codex-low",
+	"gpt-5-1-codex-medium":       "gpt-5-1-codex-medium",
+	"gpt-5-1-codex-high":         "gpt-5-1-codex-high",
+	"gpt-5-1-codex-max-low":      "gpt-5-1-codex-max-low",
+	"gpt-5-1-codex-max-medium":   "gpt-5-1-codex-max-medium",
+	"gpt-5-1-codex-max-high":     "gpt-5-1-codex-max-high",
+	"gpt-5-1-codex-max-xhigh":    "gpt-5-1-codex-max-xhigh",
+	"gpt-5-2-codex-low":          "gpt-5-2-codex-low",
 }

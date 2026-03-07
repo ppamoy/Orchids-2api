@@ -54,78 +54,54 @@ func channelFromPath(path string) string {
 	if strings.HasPrefix(path, "/warp/") {
 		return "warp"
 	}
+	if strings.HasPrefix(path, "/grok/v1/") {
+		return "grok"
+	}
 	return ""
 }
 
 // mapModel 根据请求的 model 名称映射到 orchids 上游实际支持的模型
-// orchids 支持: claude-opus-4-6, claude-opus-4-6-thinking, claude-sonnet-4-5, claude-opus-4-5,
-//
-//	claude-sonnet-4-5-thinking, claude-opus-4-5-thinking, claude-haiku-4-5,
-//	claude-sonnet-4-20250514, claude-3-7-sonnet-20250219
+// 以当前 Orchids 公共模型为准（会随上游更新）：claude-sonnet-4-6 / claude-opus-4.6 / claude-haiku-4-5 等。
 func mapModel(requestModel string) string {
-	lower := strings.ToLower(requestModel)
-	isThinking := strings.Contains(lower, "thinking")
-
-	switch {
-	// opus-4-6 / opus-4.6 / 4-6-opus 系列
-	case strings.Contains(lower, "opus-4-6") || strings.Contains(lower, "opus-4.6") || strings.Contains(lower, "4-6-opus"):
-		if isThinking {
-			return "claude-opus-4-6-thinking"
-		}
-		return "claude-opus-4-6"
-
-	// opus-4-5 / opus-4.5 / 4-5-opus 系列
-	case strings.Contains(lower, "opus-4-5") || strings.Contains(lower, "opus-4.5") || strings.Contains(lower, "4-5-opus"):
-		if isThinking {
-			return "claude-opus-4-5-thinking"
-		}
-		return "claude-opus-4-5"
-
-	// opus 通配 → 最新 4.6
-	case strings.Contains(lower, "opus"):
-		if isThinking {
-			return "claude-opus-4-6-thinking"
-		}
-		return "claude-opus-4-6"
-
-	// sonnet-3-7 / sonnet-3.7 / 3-7-sonnet 系列
-	case strings.Contains(lower, "sonnet-3-7") || strings.Contains(lower, "sonnet-3.7") || strings.Contains(lower, "3-7-sonnet"):
-		return "claude-3-7-sonnet-20250219"
-
-	// sonnet-3-5 / sonnet-3.5 / 3-5-sonnet 旧版 → 映射到最新 sonnet
-	case strings.Contains(lower, "sonnet-3-5") || strings.Contains(lower, "sonnet-3.5") || strings.Contains(lower, "3-5-sonnet"):
-		return "claude-sonnet-4-5"
-
-	// sonnet-4-5 / sonnet-4.5 / 4-5-sonnet 系列
-	case strings.Contains(lower, "sonnet-4-5") || strings.Contains(lower, "sonnet-4.5") || strings.Contains(lower, "4-5-sonnet"):
-		if isThinking {
-			return "claude-sonnet-4-5-thinking"
-		}
-		return "claude-sonnet-4-5"
-
-	// sonnet-4-20250514 精确匹配
-	case strings.Contains(lower, "sonnet-4-20250514"):
-		return "claude-sonnet-4-20250514"
-
-	// sonnet-4 / sonnet 通配 → claude-sonnet-4-20250514
-	case strings.Contains(lower, "sonnet-4") || strings.Contains(lower, "sonnet"):
-		if isThinking {
-			return "claude-sonnet-4-5-thinking"
-		}
-		return "claude-sonnet-4-20250514"
-
-	// haiku-4-5 / haiku-4.5 / 4-5-haiku 系列
-	case strings.Contains(lower, "haiku-4-5") || strings.Contains(lower, "haiku-4.5") || strings.Contains(lower, "4-5-haiku"):
-		return "claude-haiku-4-5"
-
-	// haiku 通配
-	case strings.Contains(lower, "haiku"):
-		return "claude-haiku-4-5"
-
-	// 默认
-	default:
-		return "claude-sonnet-4-5"
+	normalized := normalizeOrchidsModelKey(requestModel)
+	if normalized == "" {
+		return "claude-sonnet-4-6"
 	}
+	if mapped, ok := orchidsModelMap[normalized]; ok {
+		return mapped
+	}
+	return "claude-sonnet-4-6"
+}
+
+func normalizeOrchidsModelKey(model string) string {
+	normalized := strings.ToLower(strings.TrimSpace(model))
+	if strings.HasPrefix(normalized, "claude-") {
+		normalized = strings.ReplaceAll(normalized, "4.6", "4-6")
+		normalized = strings.ReplaceAll(normalized, "4.5", "4-5")
+	}
+	return normalized
+}
+
+var orchidsModelMap = map[string]string{
+	"claude-sonnet-4-5":          "claude-sonnet-4-6",
+	"claude-sonnet-4-6":          "claude-sonnet-4-6",
+	"claude-sonnet-4-5-thinking": "claude-sonnet-4-5-thinking",
+	"claude-sonnet-4-6-thinking": "claude-sonnet-4-6",
+	"claude-opus-4-6":            "claude-opus-4-6",
+	"claude-opus-4-5":            "claude-opus-4-6",
+	"claude-opus-4-5-thinking":   "claude-opus-4-5-thinking",
+	"claude-opus-4-6-thinking":   "claude-opus-4-6",
+	"claude-haiku-4-5":           "claude-haiku-4-5",
+	"claude-sonnet-4-20250514":   "claude-sonnet-4-20250514",
+	"claude-3-7-sonnet-20250219": "claude-3-7-sonnet-20250219",
+	"gemini-3-flash":             "gemini-3-flash",
+	"gemini-3-pro":               "gemini-3-pro",
+	"gpt-5.3-codex":              "gpt-5.3-codex",
+	"gpt-5.2-codex":              "gpt-5.2-codex",
+	"gpt-5.2":                    "gpt-5.2",
+	"grok-4.1-fast":              "grok-4.1-fast",
+	"glm-5":                      "glm-5",
+	"kimi-k2.5":                  "kimi-k2.5",
 }
 
 func conversationKeyForRequest(r *http.Request, req ClaudeRequest) string {
@@ -169,42 +145,55 @@ func headerValue(r *http.Request, keys ...string) string {
 func extractUserText(messages []prompt.Message) string {
 	for i := len(messages) - 1; i >= 0; i-- {
 		msg := messages[i]
-		if msg.Role != "user" {
-			continue
-		}
-		if msg.Content.IsString() {
-			return strings.TrimSpace(msg.Content.GetText())
-		}
-		var parts []string
-		for _, block := range msg.Content.GetBlocks() {
-			if block.Type == "text" {
-				text := strings.TrimSpace(block.Text)
-				if text != "" {
-					parts = append(parts, text)
-				}
+		if msg.Role == "user" {
+			if text := msg.ExtractText(); text != "" {
+				return text
 			}
 		}
-		return strings.TrimSpace(strings.Join(parts, "\n"))
 	}
 	return ""
 }
 
-func isSuggestionMode(messages []prompt.Message) bool {
+func lastUserIsToolResultOnly(messages []prompt.Message) bool {
 	for i := len(messages) - 1; i >= 0; i-- {
 		msg := messages[i]
 		if msg.Role != "user" {
 			continue
 		}
 		if msg.Content.IsString() {
-			return containsSuggestionMode(msg.Content.GetText())
+			return false
 		}
-		for _, block := range msg.Content.GetBlocks() {
-			if block.Type == "text" {
-				return containsSuggestionMode(block.Text)
+		blocks := msg.Content.GetBlocks()
+		hasToolResult := false
+		for _, block := range blocks {
+			switch block.Type {
+			case "tool_result":
+				hasToolResult = true
+			case "text":
+				if strings.TrimSpace(block.Text) != "" {
+					return false
+				}
+			default:
+				if strings.TrimSpace(block.Type) != "" {
+					return false
+				}
 			}
 		}
-		// 最近一条 user 消息没有文本内容，避免回溯旧的 suggestion prompt 误判
-		return false
+		return hasToolResult
+	}
+	return false
+}
+
+func isSuggestionMode(messages []prompt.Message) bool {
+	for i := len(messages) - 1; i >= 0; i-- {
+		msg := messages[i]
+		if msg.Role == "user" {
+			text := msg.ExtractText()
+			if text != "" {
+				return containsSuggestionMode(text)
+			}
+			return false
+		}
 	}
 	return false
 }
@@ -271,26 +260,9 @@ func extractUserTexts(messages []prompt.Message) []string {
 		if strings.ToLower(strings.TrimSpace(msg.Role)) != "user" {
 			continue
 		}
-		if msg.Content.IsString() {
-			text := strings.TrimSpace(stripSystemRemindersForMode(msg.Content.GetText()))
-			if text != "" {
-				texts = append(texts, text)
-			}
-			continue
-		}
-		var parts []string
-		for _, block := range msg.Content.GetBlocks() {
-			if strings.ToLower(strings.TrimSpace(block.Type)) != "text" {
-				continue
-			}
-			text := strings.TrimSpace(stripSystemRemindersForMode(block.Text))
-			if text != "" {
-				parts = append(parts, text)
-			}
-		}
-		merged := strings.TrimSpace(strings.Join(parts, "\n"))
-		if merged != "" {
-			texts = append(texts, merged)
+		text := strings.TrimSpace(stripSystemRemindersForMode(msg.ExtractText()))
+		if text != "" {
+			texts = append(texts, text)
 		}
 	}
 	return texts

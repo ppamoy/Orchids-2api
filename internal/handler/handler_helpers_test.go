@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -8,10 +9,11 @@ import (
 )
 
 func TestResolveWorkdir_NoSessionFallbackWithoutExplicitConversation(t *testing.T) {
+	ss := NewMemorySessionStore(30*time.Minute, 100)
+	ss.SetWorkdir(context.TODO(), "k1", "/stale/workdir")
+
 	h := &Handler{
-		sessionWorkdirs:   map[string]string{"k1": "/stale/workdir"},
-		sessionConvIDs:    map[string]string{},
-		sessionLastAccess: map[string]time.Time{},
+		sessionStore: ss,
 	}
 	r := httptest.NewRequest(http.MethodPost, "http://example.com/warp/v1/messages", nil)
 	req := ClaudeRequest{}

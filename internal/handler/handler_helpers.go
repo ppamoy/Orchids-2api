@@ -3,25 +3,70 @@ package handler
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
+	apperrors "orchids-api/internal/errors"
 	"orchids-api/internal/orchids"
 	"orchids-api/internal/store"
 	"orchids-api/internal/warp"
 )
+
+var modelVersionHyphenAlias = regexp.MustCompile(`-(\d{1,2})-(\d{1,2})`)
+var modelVersionDotAlias = regexp.MustCompile(`-(\d{1,2})\.(\d{1,2})`)
+
+func resolveModelAliasCandidates(modelID string) []string {
+	modelID = strings.ToLower(strings.TrimSpace(modelID))
+	if modelID == "" {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	add := func(v string, out *[]string) {
+		v = strings.ToLower(strings.TrimSpace(v))
+		if v == "" {
+			return
+		}
+		if _, ok := seen[v]; ok {
+			return
+		}
+		seen[v] = struct{}{}
+		*out = append(*out, v)
+	}
+
+	out := make([]string, 0, 3)
+	add(modelID, &out)
+	add(modelVersionHyphenAlias.ReplaceAllString(modelID, "-$1.$2"), &out)
+	add(modelVersionDotAlias.ReplaceAllString(modelID, "-$1-$2"), &out)
+	return out
+}
+
+func (h *Handler) resolveModelAlias(ctx context.Context, modelID string) (string, *store.Model) {
+	if h == nil || h.loadBalancer == nil || h.loadBalancer.Store == nil {
+		return modelID, nil
+	}
+	candidates := resolveModelAliasCandidates(modelID)
+	if len(candidates) == 0 {
+		return modelID, nil
+	}
+	for _, cand := range candidates {
+		if m, err := h.loadBalancer.Store.GetModelByModelID(ctx, cand); err == nil && m != nil {
+			return cand, m
+		}
+	}
+	return modelID, nil
+}
 
 // resolveWorkdir determines the working directory from headers, system prompt, or session.
 // 返回当前 workdir、上一轮 workdir、以及是否发生变更。
 func (h *Handler) resolveWorkdir(r *http.Request, req ClaudeRequest, conversationKey string) (string, string, bool) {
 	prevWorkdir := ""
 	if conversationKey != "" {
-		h.sessionWorkdirsMu.RLock()
-		prevWorkdir = h.sessionWorkdirs[conversationKey]
-		h.sessionWorkdirsMu.RUnlock()
+		prevWorkdir, _ = h.sessionStore.GetWorkdir(r.Context(), conversationKey)
 	}
 
 	// Prefer explicit workdir from request payload/header/system.
@@ -40,20 +85,17 @@ func (h *Handler) resolveWorkdir(r *http.Request, req ClaudeRequest, conversatio
 	if dynamicWorkdir == "" && hasExplicitSession && prevWorkdir != "" {
 		dynamicWorkdir = prevWorkdir
 		source = "session"
-		slog.Info("Recovered workdir from session", "workdir", dynamicWorkdir, "session", conversationKey)
+		slog.Debug("Recovered workdir from session", "workdir", dynamicWorkdir, "session", conversationKey)
 	}
 
 	// Persist for future turns in this session
 	if dynamicWorkdir != "" && conversationKey != "" {
-		h.sessionWorkdirsMu.Lock()
-		h.sessionWorkdirs[conversationKey] = dynamicWorkdir
-		h.sessionLastAccess[conversationKey] = time.Now()
-		h.cleanupSessionWorkdirsLocked()
-		h.sessionWorkdirsMu.Unlock()
+		h.sessionStore.SetWorkdir(r.Context(), conversationKey, dynamicWorkdir)
+		h.sessionStore.Touch(r.Context(), conversationKey)
 	}
 
 	if dynamicWorkdir != "" {
-		slog.Info("Using dynamic workdir", "workdir", dynamicWorkdir, "source", source)
+		slog.Debug("Using dynamic workdir", "workdir", dynamicWorkdir, "source", source)
 	}
 	rawPrev := strings.TrimSpace(prevWorkdir)
 	rawNext := strings.TrimSpace(dynamicWorkdir)
@@ -70,38 +112,69 @@ func (h *Handler) resolveWorkdir(r *http.Request, req ClaudeRequest, conversatio
 }
 
 // selectAccount logic extracted from HandleMessages
-func (h *Handler) selectAccount(ctx context.Context, model, forcedChannel string, failedAccountIDs []int64) (UpstreamClient, *store.Account, error) {
+func (h *Handler) selectAccount(ctx context.Context, targetChannel string, channelRequired bool, failedAccountIDs []int64) (UpstreamClient, *store.Account, error) {
 	if h.loadBalancer != nil {
-		targetChannel := forcedChannel
-		if targetChannel == "" {
-			targetChannel = h.loadBalancer.GetModelChannel(ctx, model)
-		}
 		if targetChannel != "" {
-			slog.Info("Model recognition", "model", model, "channel", targetChannel)
+			slog.Debug("Account channel selection", "channel", targetChannel, "channel_required", channelRequired)
 		}
 		account, err := h.loadBalancer.GetNextAccountExcludingByChannel(ctx, failedAccountIDs, targetChannel)
 		if err != nil {
-			if forcedChannel != "" {
+			if channelRequired {
 				return nil, nil, err
 			}
 			if h.client != nil {
-				slog.Info("Load balancer: no available accounts for channel, using default config", "channel", targetChannel)
+				slog.Debug("Load balancer: no available accounts for channel, using default config", "channel", targetChannel)
 				return h.client, nil, nil
 			}
 			return nil, nil, err
 		}
-		var client UpstreamClient
-		if strings.EqualFold(account.AccountType, "warp") {
-			client = warp.NewFromAccount(account, h.config)
-		} else {
-			orchidsClient := orchids.NewFromAccount(account, h.config)
-			client = orchidsClient
+		client := h.getOrCreateAccountClient(account)
+		if client == nil {
+			return nil, nil, errors.New("no client configured")
 		}
 		return client, account, nil
 	} else if h.client != nil {
 		return h.client, nil, nil
 	}
 	return nil, nil, errors.New("no client configured")
+}
+
+func (h *Handler) validateModelAvailability(ctx context.Context, modelID, forcedChannel string) (*store.Model, error) {
+	if h == nil || h.loadBalancer == nil || h.loadBalancer.Store == nil {
+		return nil, nil
+	}
+	modelID = strings.TrimSpace(modelID)
+	if modelID == "" {
+		return nil, nil
+	}
+	resolvedModelID, m := h.resolveModelAlias(ctx, modelID)
+	if strings.EqualFold(forcedChannel, "warp") {
+		if mapped := warp.ResolveModelAlias(resolvedModelID); mapped != "" {
+			resolvedModelID = mapped
+			if m == nil || !strings.EqualFold(strings.TrimSpace(m.ModelID), resolvedModelID) {
+				resolved, err := h.loadBalancer.Store.GetModelByModelID(ctx, resolvedModelID)
+				if err == nil {
+					m = resolved
+				}
+			}
+		}
+	}
+	if m == nil {
+		return nil, fmt.Errorf("model not found")
+	}
+	if !m.Status.Enabled() {
+		return nil, fmt.Errorf("model not available")
+	}
+	if forcedChannel != "" {
+		mChannel := strings.TrimSpace(m.Channel)
+		if mChannel == "" {
+			mChannel = "orchids"
+		}
+		if !strings.EqualFold(mChannel, forcedChannel) {
+			return nil, fmt.Errorf("model not found")
+		}
+	}
+	return m, nil
 }
 
 func (h *Handler) updateAccountStats(account *store.Account, inputTokens, outputTokens int) {
@@ -131,9 +204,9 @@ func (h *Handler) syncWarpState(account *store.Account, client UpstreamClient, s
 		if warpClient, ok := client.(*warp.Client); ok {
 			changed = warpClient.SyncAccountState()
 		}
-	} else if orchidsClient, ok := client.(*orchids.Client); ok {
+	} else if _, ok := client.(*orchids.Client); ok {
 		// Orchids 账号：通过快照比较检测 forceRefreshToken 是否更新了账号信息
-		changed = orchidsClient.SyncAccountState(snapshot)
+		changed = account.SyncState(snapshot)
 	}
 
 	if changed {
@@ -145,68 +218,12 @@ func (h *Handler) syncWarpState(account *store.Account, client UpstreamClient, s
 	}
 }
 
-const (
-	sessionMaxSize         = 1024
-	sessionCleanupInterval = 5 * time.Minute
-	sessionMaxAge          = 30 * time.Minute
-)
+// upstreamErrorClass is a local alias for the centralized type.
+type upstreamErrorClass = apperrors.UpstreamErrorClass
 
-// cleanupSessionWorkdirsLocked removes stale session entries.
-// Must be called with sessionWorkdirsMu held for writing.
-func (h *Handler) cleanupSessionWorkdirsLocked() {
-	now := time.Now()
-	if len(h.sessionWorkdirs) < sessionMaxSize && now.Sub(h.sessionCleanupRun) < sessionCleanupInterval {
-		return
-	}
-	for key, lastAccess := range h.sessionLastAccess {
-		if now.Sub(lastAccess) > sessionMaxAge {
-			delete(h.sessionWorkdirs, key)
-			delete(h.sessionConvIDs, key)
-			delete(h.sessionLastAccess, key)
-		}
-	}
-	h.sessionCleanupRun = now
-}
-
-type upstreamErrorClass struct {
-	category      string
-	retryable     bool
-	switchAccount bool
-}
-
+// classifyUpstreamError delegates to the centralized errors package.
 func classifyUpstreamError(errStr string) upstreamErrorClass {
-	lower := strings.ToLower(errStr)
-	switch {
-	case strings.Contains(lower, "context canceled") || strings.Contains(lower, "canceled"):
-		return upstreamErrorClass{category: "canceled", retryable: false, switchAccount: false}
-	case hasExplicitHTTPStatus(lower, "401") ||
-		strings.Contains(lower, "signed out") || strings.Contains(lower, "signed_out"):
-		return upstreamErrorClass{category: "auth", retryable: true, switchAccount: true}
-	case hasExplicitHTTPStatus(lower, "403"):
-		return upstreamErrorClass{category: "auth_blocked", retryable: true, switchAccount: true}
-	case hasExplicitHTTPStatus(lower, "404"):
-		return upstreamErrorClass{category: "auth_blocked", retryable: false, switchAccount: false}
-	case strings.Contains(lower, "input is too long") || hasExplicitHTTPStatus(lower, "400"):
-		return upstreamErrorClass{category: "client", retryable: false, switchAccount: false}
-	case hasExplicitHTTPStatus(lower, "429") ||
-		strings.Contains(lower, "too many requests") ||
-		strings.Contains(lower, "rate limit") ||
-		strings.Contains(lower, "no remaining quota") ||
-		strings.Contains(lower, "out of credits") ||
-		strings.Contains(lower, "credits exhausted") ||
-		strings.Contains(lower, "run out of credits"):
-		return upstreamErrorClass{category: "rate_limit", retryable: true, switchAccount: true}
-	case strings.Contains(lower, "timeout") || strings.Contains(lower, "deadline exceeded") || strings.Contains(lower, "context deadline"):
-		return upstreamErrorClass{category: "timeout", retryable: true, switchAccount: true}
-	case strings.Contains(lower, "connection reset") || strings.Contains(lower, "connection refused") ||
-		strings.Contains(lower, "unexpected eof") || strings.Contains(lower, "use of closed") ||
-		strings.Contains(lower, "broken pipe") || strings.HasSuffix(lower, ": eof") || lower == "eof":
-		return upstreamErrorClass{category: "network", retryable: true, switchAccount: true}
-	case hasExplicitHTTPStatus(lower, "500") || hasExplicitHTTPStatus(lower, "502") || hasExplicitHTTPStatus(lower, "503") || hasExplicitHTTPStatus(lower, "504"):
-		return upstreamErrorClass{category: "server", retryable: true, switchAccount: true}
-	default:
-		return upstreamErrorClass{category: "unknown", retryable: true, switchAccount: true}
-	}
+	return apperrors.ClassifyUpstreamError(errStr)
 }
 
 func computeRetryDelay(base time.Duration, attempt int, category string) time.Duration {
