@@ -2,10 +2,13 @@
 package middleware
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"time"
 )
@@ -53,11 +56,6 @@ func TraceMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// TraceFunc 是 TraceMiddleware 的 HandlerFunc 版本
-func TraceFunc(next http.HandlerFunc) http.HandlerFunc {
-	return TraceMiddleware(next).ServeHTTP
-}
-
 // GetTraceID 从 context 获取 trace ID
 func GetTraceID(ctx context.Context) string {
 	if ctx == nil {
@@ -67,20 +65,6 @@ func GetTraceID(ctx context.Context) string {
 		return traceID
 	}
 	return ""
-}
-
-// WithTraceID 创建带有 trace ID 的新 context
-func WithTraceID(ctx context.Context, traceID string) context.Context {
-	return context.WithValue(ctx, traceIDKey{}, traceID)
-}
-
-// LogWithTrace 返回带有 trace ID 的 logger
-func LogWithTrace(ctx context.Context) *slog.Logger {
-	traceID := GetTraceID(ctx)
-	if traceID == "" {
-		return slog.Default()
-	}
-	return slog.Default().With("trace_id", traceID)
 }
 
 // TracedResponseWriter 包装 ResponseWriter 以记录响应状态
@@ -118,6 +102,15 @@ func (w *TracedResponseWriter) Flush() {
 	}
 }
 
+// Hijack 实现 http.Hijacker，保证 WebSocket 升级等场景可用。
+func (w *TracedResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hj, ok := w.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("response writer does not support hijacking")
+	}
+	return hj.Hijack()
+}
+
 // LoggingMiddleware 记录请求日志，包含 trace ID 和耗时
 func LoggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -140,7 +133,7 @@ func LoggingMiddleware(next http.Handler) http.Handler {
 
 		// 记录请求完成
 		duration := time.Since(start)
-		level := slog.LevelInfo
+		level := slog.LevelDebug
 		if wrapped.StatusCode >= 500 {
 			level = slog.LevelError
 		} else if wrapped.StatusCode >= 400 {
@@ -161,16 +154,6 @@ func LoggingMiddleware(next http.Handler) http.Handler {
 // Chain 链式组合多个中间件
 func Chain(middlewares ...func(http.Handler) http.Handler) func(http.Handler) http.Handler {
 	return func(final http.Handler) http.Handler {
-		for i := len(middlewares) - 1; i >= 0; i-- {
-			final = middlewares[i](final)
-		}
-		return final
-	}
-}
-
-// ChainFunc 链式组合多个中间件（HandlerFunc 版本）
-func ChainFunc(middlewares ...func(http.HandlerFunc) http.HandlerFunc) func(http.HandlerFunc) http.HandlerFunc {
-	return func(final http.HandlerFunc) http.HandlerFunc {
 		for i := len(middlewares) - 1; i >= 0; i-- {
 			final = middlewares[i](final)
 		}

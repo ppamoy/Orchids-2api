@@ -1,11 +1,11 @@
 package handler
 
 import (
-	"encoding/json"
+	"github.com/goccy/go-json"
 	"net/http"
 
 	"orchids-api/internal/debug"
-	"orchids-api/internal/prompt"
+	"orchids-api/internal/orchids"
 )
 
 // HandleCountTokens handles /v1/messages/count_tokens requests.
@@ -25,30 +25,36 @@ func (h *Handler) HandleCountTokens(w http.ResponseWriter, r *http.Request) {
 	defer logger.Close()
 	logger.LogIncomingRequest(req)
 
-	conversationKey := conversationKeyForRequest(r, req)
-	opts := prompt.PromptOptions{
-		Context:          r.Context(),
-		ConversationID:   conversationKey,
-		MaxTokens:        h.config.ContextMaxTokens,
-		SummaryMaxTokens: h.config.ContextSummaryMaxTokens,
-		KeepTurns:        h.config.ContextKeepTurns,
-		SummaryCache:     h.summaryCache,
+	breakdown := inputTokenBreakdown{}
+	profile := ""
+	if channelFromPath(r.URL.Path) == "warp" {
+		if warpBD, warpProfile, err := estimateWarpInputTokenBreakdown("", req.Model, req.Messages, req.Tools, len(req.Tools) == 0); err == nil {
+			breakdown = warpBD
+			profile = warpProfile
+		}
+	}
+	if breakdown.Total == 0 {
+		builtPrompt, promptHistory, meta := orchids.BuildCodeFreeMaxPromptAndHistoryWithMeta(
+			req.Messages,
+			req.System,
+			true, /* noThinking */
+		)
+		breakdown = estimateOrchidsInputTokenBreakdown(builtPrompt, promptHistory)
+		profile = meta.Profile
 	}
 
-	builtPrompt := prompt.BuildPromptV2WithOptions(prompt.ClaudeAPIRequest{
-		Model:    req.Model,
-		Messages: req.Messages,
-		System:   req.System,
-		Tools:    req.Tools,
-		Stream:   false,
-	}, opts)
-
-	inputTokens := h.estimateInputTokens(r.Context(), req.Model, builtPrompt)
-
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(map[string]int{
-		"input_tokens": inputTokens,
-	}); err != nil {
+	resp := map[string]interface{}{
+		"input_tokens":   breakdown.Total,
+		"prompt_profile": profile,
+		"breakdown": map[string]int{
+			"base_prompt_tokens":    breakdown.BasePromptTokens,
+			"system_context_tokens": breakdown.SystemContextTokens,
+			"history_tokens":        breakdown.HistoryTokens,
+			"tools_tokens":          breakdown.ToolsTokens,
+		},
+	}
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		// Log error but we can't do much else since headers are written
 		_ = err
 	}

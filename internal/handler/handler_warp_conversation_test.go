@@ -3,7 +3,7 @@ package handler
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"github.com/goccy/go-json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"orchids-api/internal/audit"
 	"orchids-api/internal/config"
 	"orchids-api/internal/debug"
 	"orchids-api/internal/prompt"
@@ -21,6 +22,7 @@ type fakePayloadClient struct {
 	mu                  sync.Mutex
 	calls               []upstream.UpstreamRequest
 	conversationIDsByOp []string
+	eventsByOp          [][]upstream.SSEMessage
 }
 
 func (f *fakePayloadClient) SendRequest(ctx context.Context, prompt string, chatHistory []interface{}, model string, onMessage func(upstream.SSEMessage), logger *debug.Logger) error {
@@ -35,7 +37,18 @@ func (f *fakePayloadClient) SendRequestWithPayload(ctx context.Context, req upst
 	if idx >= 0 && idx < len(f.conversationIDsByOp) {
 		convID = f.conversationIDsByOp[idx]
 	}
+	var events []upstream.SSEMessage
+	if idx >= 0 && idx < len(f.eventsByOp) {
+		events = f.eventsByOp[idx]
+	}
 	f.mu.Unlock()
+
+	if len(events) > 0 {
+		for _, event := range events {
+			onMessage(event)
+		}
+		return nil
+	}
 
 	if convID != "" {
 		onMessage(upstream.SSEMessage{
@@ -79,20 +92,23 @@ func makeWarpRequestBody(t *testing.T, text, conversationID string) []byte {
 	return body
 }
 
+func newTestHandler(client UpstreamClient) *Handler {
+	return &Handler{
+		config:       &config.Config{DebugEnabled: false},
+		client:       client,
+		sessionStore: NewMemorySessionStore(30*time.Minute, 1024),
+		dedupStore:   NewMemoryDedupStore(duplicateWindow, duplicateCleanupWindow),
+		auditLogger:  audit.NewNopLogger(),
+	}
+}
+
 func TestWarpConversationID_NotPersistedWithoutConversationKey(t *testing.T) {
 	t.Parallel()
 
 	client := &fakePayloadClient{
 		conversationIDsByOp: []string{"warp_upstream_conv_1", "warp_upstream_conv_2"},
 	}
-	h := &Handler{
-		config:            &config.Config{DebugEnabled: false},
-		client:            client,
-		sessionWorkdirs:   map[string]string{},
-		sessionConvIDs:    map[string]string{},
-		sessionLastAccess: map[string]time.Time{},
-		recentRequests:    map[string]*recentRequest{},
-	}
+	h := newTestHandler(client)
 
 	req1 := httptest.NewRequest(http.MethodPost, "/warp/v1/messages", bytes.NewReader(makeWarpRequestBody(t, "first", "")))
 	rec1 := httptest.NewRecorder()
@@ -122,8 +138,54 @@ func TestWarpConversationID_NotPersistedWithoutConversationKey(t *testing.T) {
 	if calls[1].ChatSessionID == "warp_upstream_conv_1" {
 		t.Fatalf("second request unexpectedly reused upstream conversation id: %q", calls[1].ChatSessionID)
 	}
-	if _, ok := h.sessionConvIDs[""]; ok {
+	// Verify empty conversation key does not store convID
+	if _, ok := h.sessionStore.GetConvID(context.Background(), ""); ok {
 		t.Fatalf("unexpected cached conversation id for empty conversation key")
+	}
+}
+
+func TestOrchidsPayload_UsesProtocolPromptView(t *testing.T) {
+	t.Parallel()
+
+	client := &fakePayloadClient{}
+	h := newTestHandler(client)
+
+	reqPayload := ClaudeRequest{
+		Model: "claude-sonnet-4-6",
+		Messages: []prompt.Message{
+			{Role: "user", Content: prompt.MessageContent{Text: "hi"}},
+		},
+		System: []prompt.SystemItem{
+			{Type: "text", Text: "system rules"},
+		},
+		Stream: false,
+		Tools:  []interface{}{},
+	}
+
+	body, err := json.Marshal(reqPayload)
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/orchids/v1/messages", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.HandleMessages(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	calls := client.snapshotCalls()
+	if len(calls) != 1 {
+		t.Fatalf("calls len=%d want 1", len(calls))
+	}
+	if strings.Contains(calls[0].Prompt, "<env>") || strings.Contains(calls[0].Prompt, "<rules>") {
+		t.Fatalf("prompt=%q want protocol prompt without legacy wrapper", calls[0].Prompt)
+	}
+	if !strings.Contains(calls[0].Prompt, "<user>") || !strings.Contains(calls[0].Prompt, "hi") {
+		t.Fatalf("prompt=%q want protocol user block", calls[0].Prompt)
+	}
+	if len(calls[0].ChatHistory) != 0 {
+		t.Fatalf("chatHistory=%#v want empty for orchids protocol mode", calls[0].ChatHistory)
 	}
 }
 
@@ -133,14 +195,7 @@ func TestWarpConversationID_PersistedWithConversationKey(t *testing.T) {
 	client := &fakePayloadClient{
 		conversationIDsByOp: []string{"warp_upstream_conv_persist"},
 	}
-	h := &Handler{
-		config:            &config.Config{DebugEnabled: false},
-		client:            client,
-		sessionWorkdirs:   map[string]string{},
-		sessionConvIDs:    map[string]string{},
-		sessionLastAccess: map[string]time.Time{},
-		recentRequests:    map[string]*recentRequest{},
-	}
+	h := newTestHandler(client)
 
 	const conversationID = "local_conversation_key_1"
 
@@ -182,11 +237,10 @@ func TestWarpPassthrough_DoesNotTrimMessagesOrSanitizeSystem(t *testing.T) {
 			WarpMaxToolResults:      1,
 			OrchidsCCEntrypointMode: "strip",
 		},
-		client:            client,
-		sessionWorkdirs:   map[string]string{},
-		sessionConvIDs:    map[string]string{},
-		sessionLastAccess: map[string]time.Time{},
-		recentRequests:    map[string]*recentRequest{},
+		client:       client,
+		sessionStore: NewMemorySessionStore(30*time.Minute, 1024),
+		dedupStore:   NewMemoryDedupStore(duplicateWindow, duplicateCleanupWindow),
+		auditLogger:  audit.NewNopLogger(),
 	}
 
 	reqPayload := ClaudeRequest{
@@ -232,5 +286,205 @@ func TestWarpPassthrough_DoesNotTrimMessagesOrSanitizeSystem(t *testing.T) {
 	}
 	if !strings.Contains(calls[0].System[1].Text, "cc_entrypoint=claude-code") {
 		t.Fatalf("expected cc_entrypoint to be preserved for warp, got %q", calls[0].System[1].Text)
+	}
+}
+
+func TestWarpToolResultFollowupWithText_DisablesTools(t *testing.T) {
+	t.Parallel()
+
+	client := &fakePayloadClient{}
+	h := newTestHandler(client)
+
+	body := []byte(`{
+		"model":"claude-opus-4-6",
+		"stream":false,
+		"messages":[
+			{
+				"role":"user",
+				"content":[
+					{"type":"text","text":"You are an interactive agent that helps users with software engineering tasks.\n# Environment\nPrimary working directory: /Users/dailin/Documents/GitHub/truth_social_scraper\n# auto memory\ngitStatus: dirty\nRecent commits: abcdef"}
+				]
+			},
+			{
+				"role":"assistant",
+				"content":[
+					{"type":"tool_use","id":"tool_1","name":"Read","input":{"file_path":"utils.py"}}
+				]
+			},
+			{
+				"role":"user",
+				"content":[
+					{"type":"tool_result","tool_use_id":"tool_1","content":"1→import json\n2→import os\n3→from urllib.request import Request\n4→import socks\n5→from flask import Flask\n6→def load_media_mapping():\n7→    with open(MEDIA_MAPPING_FILE, \"r\") as f:\n8→        return json.load(f)\n9→ALERTS_FILE = os.path.join(PROJECT_ROOT, \"market_alerts.json\")"},
+					{"type":"text","text":"这个项目使用了哪些技术架构"}
+				]
+			}
+		],
+		"tools":[]
+	}`)
+
+	req := httptest.NewRequest(http.MethodPost, "/warp/v1/messages", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	h.HandleMessages(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("request status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	calls := client.snapshotCalls()
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 upstream call, got %d", len(calls))
+	}
+	if calls[0].NoTools {
+		t.Fatalf("expected warp follow-up with tool_result+text to keep passthrough tools enabled")
+	}
+}
+
+func TestWarpToolResultFollowup_SplitsCurrentTurnAndChainsConversationIDs(t *testing.T) {
+	t.Parallel()
+
+	client := &fakePayloadClient{
+		conversationIDsByOp: []string{"warp_conv_batch_1", "warp_conv_batch_2"},
+	}
+	h := newTestHandler(client)
+
+	body := []byte(`{
+		"model":"claude-opus-4-6",
+		"stream":false,
+		"conversation_id":"local_conversation_key_split",
+		"messages":[
+			{"role":"user","content":[{"type":"text","text":"帮我优化一下这个项目"}]},
+			{"role":"assistant","content":[
+				{"type":"tool_use","id":"tool_ls","name":"Bash","input":{"command":"ls -la /Users/dailin/Documents/GitHub/truth_social_scraper"}},
+				{"type":"tool_use","id":"tool_api","name":"Read","input":{"file_path":"/Users/dailin/Documents/GitHub/truth_social_scraper/api.py"}},
+				{"type":"tool_use","id":"tool_utils","name":"Read","input":{"file_path":"/Users/dailin/Documents/GitHub/truth_social_scraper/utils.py"}}
+			]},
+			{"role":"user","content":[
+				{"type":"tool_result","tool_use_id":"tool_ls","content":"README.md\napi.py\nutils.py"},
+				{"type":"tool_result","tool_use_id":"tool_api","content":"from fastapi import FastAPI\napp = FastAPI()"},
+				{"type":"tool_result","tool_use_id":"tool_utils","content":"import json\nALERTS_FILE='alerts.json'"},
+				{"type":"text","text":"帮我优化一下这个项目"}
+			]}
+		],
+		"tools":[]
+	}`)
+
+	req := httptest.NewRequest(http.MethodPost, "/warp/v1/messages", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	h.HandleMessages(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("request status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	calls := client.snapshotCalls()
+	if len(calls) != 3 {
+		t.Fatalf("expected 3 upstream calls, got %d", len(calls))
+	}
+	if calls[1].ChatSessionID != "warp_conv_batch_1" {
+		t.Fatalf("second batch ChatSessionID = %q, want %q", calls[1].ChatSessionID, "warp_conv_batch_1")
+	}
+	if calls[2].ChatSessionID != "warp_conv_batch_2" {
+		t.Fatalf("third batch ChatSessionID = %q, want %q", calls[2].ChatSessionID, "warp_conv_batch_2")
+	}
+
+	countToolResults := func(msgs []prompt.Message) int {
+		total := 0
+		for _, msg := range msgs {
+			for _, block := range msg.Content.Blocks {
+				if block.Type == "tool_result" {
+					total++
+				}
+			}
+		}
+		return total
+	}
+
+	if got := countToolResults(calls[0].Messages); got != 1 {
+		t.Fatalf("first batch tool_results = %d, want %d", got, 1)
+	}
+	if got := countToolResults(calls[1].Messages); got != 2 {
+		t.Fatalf("second batch tool_results = %d, want %d", got, 2)
+	}
+	if got := countToolResults(calls[2].Messages); got != 3 {
+		t.Fatalf("third batch tool_results = %d, want %d", got, 3)
+	}
+
+	for i := 0; i < 2; i++ {
+		lastMsg := calls[i].Messages[len(calls[i].Messages)-1]
+		if got := strings.TrimSpace(lastMsg.ExtractText()); got != "" {
+			t.Fatalf("batch %d unexpectedly kept current-turn user text: %q", i+1, got)
+		}
+	}
+	if got := strings.TrimSpace(calls[2].Messages[len(calls[2].Messages)-1].ExtractText()); got != "帮我优化一下这个项目" {
+		t.Fatalf("last batch user text = %q, want final user request", got)
+	}
+}
+
+func TestWarpToolResultFollowup_ReplaysVisibleIntermediateBatch(t *testing.T) {
+	t.Parallel()
+
+	client := &fakePayloadClient{
+		eventsByOp: [][]upstream.SSEMessage{
+			{
+				{Type: "model.conversation_id", Event: map[string]interface{}{"id": "warp_conv_batch_1"}},
+				{Type: "model.finish", Event: map[string]interface{}{"finishReason": "end_turn"}},
+			},
+			{
+				{Type: "model.conversation_id", Event: map[string]interface{}{"id": "warp_conv_batch_2"}},
+				{Type: "model.text-delta", Event: map[string]interface{}{"delta": "Let me dig into the rest of the codebase first."}},
+				{
+					Type: "model.tool-call",
+					Event: map[string]interface{}{
+						"toolCallId": "tool_visible",
+						"toolName":   "Read",
+						"input":      `{"file_path":"/Users/dailin/Documents/GitHub/truth_social_scraper/monitor_trump.py"}`,
+					},
+				},
+				{Type: "model.finish", Event: map[string]interface{}{"finishReason": "tool_use"}},
+			},
+		},
+	}
+	h := newTestHandler(client)
+
+	body := []byte(`{
+		"model":"claude-opus-4-6",
+		"stream":true,
+		"conversation_id":"local_conversation_key_intermediate",
+		"messages":[
+			{"role":"user","content":[{"type":"text","text":"帮我优化一下这个项目"}]},
+			{"role":"assistant","content":[
+				{"type":"tool_use","id":"tool_ls","name":"Bash","input":{"command":"ls -la /Users/dailin/Documents/GitHub/truth_social_scraper"}},
+				{"type":"tool_use","id":"tool_api","name":"Read","input":{"file_path":"/Users/dailin/Documents/GitHub/truth_social_scraper/api.py"}},
+				{"type":"tool_use","id":"tool_utils","name":"Read","input":{"file_path":"/Users/dailin/Documents/GitHub/truth_social_scraper/utils.py"}}
+			]},
+			{"role":"user","content":[
+				{"type":"tool_result","tool_use_id":"tool_ls","content":"README.md\napi.py\nutils.py"},
+				{"type":"tool_result","tool_use_id":"tool_api","content":"from fastapi import FastAPI\napp = FastAPI()"},
+				{"type":"tool_result","tool_use_id":"tool_utils","content":"import json\nALERTS_FILE='alerts.json'"},
+				{"type":"text","text":"帮我优化一下这个项目"}
+			]}
+		],
+		"tools":[]
+	}`)
+
+	req := httptest.NewRequest(http.MethodPost, "/warp/v1/messages", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	h.HandleMessages(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("request status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	calls := client.snapshotCalls()
+	if len(calls) != 2 {
+		t.Fatalf("expected batching to stop after visible intermediate output, got %d calls", len(calls))
+	}
+
+	out := rec.Body.String()
+	if !strings.Contains(out, "Let me dig into the rest of the codebase first.") {
+		t.Fatalf("expected intermediate text to be replayed, got: %s", out)
+	}
+	if !strings.Contains(out, "monitor_trump.py") {
+		t.Fatalf("expected intermediate tool call to be replayed, got: %s", out)
 	}
 }

@@ -33,7 +33,7 @@ func ReleaseStringBuilder(sb *strings.Builder) {
 // MapPool provides reusable map[string]interface{} instances.
 var MapPool = sync.Pool{
 	New: func() interface{} {
-		return make(map[string]interface{}, 16)
+		return make(map[string]interface{}, 64)
 	},
 }
 

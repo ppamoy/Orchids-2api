@@ -1,11 +1,27 @@
 package middleware
 
 import (
+	"bufio"
 	"context"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+
+	"github.com/gorilla/websocket"
 )
+
+type hijackableRecorder struct {
+	*httptest.ResponseRecorder
+	hijackErr error
+	hijacked  bool
+}
+
+func (h *hijackableRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	h.hijacked = true
+	return nil, nil, h.hijackErr
+}
 
 func TestGenerateTraceID(t *testing.T) {
 	t.Run("generates unique IDs", func(t *testing.T) {
@@ -89,26 +105,6 @@ func TestTraceMiddleware(t *testing.T) {
 	})
 }
 
-func TestTraceFunc(t *testing.T) {
-	called := false
-	handler := TraceFunc(func(w http.ResponseWriter, r *http.Request) {
-		called = true
-		traceID := GetTraceID(r.Context())
-		if traceID == "" {
-			t.Error("trace ID not found in context")
-		}
-	})
-
-	req := httptest.NewRequest("GET", "/", nil)
-	w := httptest.NewRecorder()
-
-	handler.ServeHTTP(w, req)
-
-	if !called {
-		t.Error("handler was not called")
-	}
-}
-
 func TestGetTraceID(t *testing.T) {
 	t.Run("returns empty for context without trace ID", func(t *testing.T) {
 		ctx := context.Background()
@@ -119,35 +115,9 @@ func TestGetTraceID(t *testing.T) {
 
 	t.Run("returns trace ID from context", func(t *testing.T) {
 		expected := "test-trace-id"
-		ctx := WithTraceID(context.Background(), expected)
+		ctx := context.WithValue(context.Background(), traceIDKey{}, expected)
 		if got := GetTraceID(ctx); got != expected {
 			t.Errorf("GetTraceID(ctx) = %q, want %q", got, expected)
-		}
-	})
-}
-
-func TestWithTraceID(t *testing.T) {
-	expected := "my-trace-id"
-	ctx := WithTraceID(context.Background(), expected)
-	got := GetTraceID(ctx)
-	if got != expected {
-		t.Errorf("GetTraceID after WithTraceID = %q, want %q", got, expected)
-	}
-}
-
-func TestLogWithTrace(t *testing.T) {
-	t.Run("returns logger without trace ID", func(t *testing.T) {
-		logger := LogWithTrace(context.Background())
-		if logger == nil {
-			t.Error("LogWithTrace returned nil")
-		}
-	})
-
-	t.Run("returns logger with trace ID", func(t *testing.T) {
-		ctx := WithTraceID(context.Background(), "test-id")
-		logger := LogWithTrace(ctx)
-		if logger == nil {
-			t.Error("LogWithTrace returned nil")
 		}
 	})
 }
@@ -192,6 +162,32 @@ func TestTracedResponseWriter(t *testing.T) {
 		// Should not panic
 		traced.Flush()
 	})
+
+	t.Run("hijack delegates to underlying writer", func(t *testing.T) {
+		w := &hijackableRecorder{ResponseRecorder: httptest.NewRecorder()}
+		traced := NewTracedResponseWriter(w)
+
+		_, _, err := traced.Hijack()
+		if err != nil {
+			t.Fatalf("Hijack() error = %v, want nil", err)
+		}
+		if !w.hijacked {
+			t.Fatal("Hijack() should delegate to underlying writer")
+		}
+	})
+
+	t.Run("hijack fails when underlying writer does not support it", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		traced := NewTracedResponseWriter(w)
+
+		_, _, err := traced.Hijack()
+		if err == nil {
+			t.Fatal("Hijack() should fail when underlying writer is not hijackable")
+		}
+		if !strings.Contains(err.Error(), "does not support hijacking") {
+			t.Fatalf("Hijack() unexpected error: %v", err)
+		}
+	})
 }
 
 func TestLoggingMiddleware(t *testing.T) {
@@ -210,6 +206,40 @@ func TestLoggingMiddleware(t *testing.T) {
 
 	if w.Code != http.StatusOK {
 		t.Errorf("status code = %d, want %d", w.Code, http.StatusOK)
+	}
+}
+
+func TestLoggingMiddleware_WebSocketUpgrade(t *testing.T) {
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool { return true },
+	}
+
+	handler := TraceMiddleware(LoggingMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("Upgrade() error = %v", err)
+			return
+		}
+		defer conn.Close()
+		_ = conn.WriteMessage(websocket.TextMessage, []byte("ok"))
+	})))
+
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("Dial() error = %v", err)
+	}
+	defer conn.Close()
+
+	_, msg, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("ReadMessage() error = %v", err)
+	}
+	if string(msg) != "ok" {
+		t.Fatalf("message = %q, want %q", string(msg), "ok")
 	}
 }
 
@@ -244,45 +274,6 @@ func TestChain(t *testing.T) {
 	chained.ServeHTTP(w, req)
 
 	expected := []string{"m1-before", "m2-before", "handler", "m2-after", "m1-after"}
-	if len(order) != len(expected) {
-		t.Fatalf("order length = %d, want %d", len(order), len(expected))
-	}
-	for i, v := range expected {
-		if order[i] != v {
-			t.Errorf("order[%d] = %q, want %q", i, order[i], v)
-		}
-	}
-}
-
-func TestChainFunc(t *testing.T) {
-	var order []string
-
-	m1 := func(next http.HandlerFunc) http.HandlerFunc {
-		return func(w http.ResponseWriter, r *http.Request) {
-			order = append(order, "m1")
-			next(w, r)
-		}
-	}
-
-	m2 := func(next http.HandlerFunc) http.HandlerFunc {
-		return func(w http.ResponseWriter, r *http.Request) {
-			order = append(order, "m2")
-			next(w, r)
-		}
-	}
-
-	final := func(w http.ResponseWriter, r *http.Request) {
-		order = append(order, "handler")
-	}
-
-	chained := ChainFunc(m1, m2)(final)
-
-	req := httptest.NewRequest("GET", "/", nil)
-	w := httptest.NewRecorder()
-
-	chained.ServeHTTP(w, req)
-
-	expected := []string{"m1", "m2", "handler"}
 	if len(order) != len(expected) {
 		t.Fatalf("order length = %d, want %d", len(order), len(expected))
 	}
