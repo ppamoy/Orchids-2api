@@ -1,48 +1,111 @@
 package api
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math/big"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/goccy/go-json"
+
 	"orchids-api/internal/auth"
+	"orchids-api/internal/bolt"
 	"orchids-api/internal/clerk"
 	"orchids-api/internal/config"
+	apperrors "orchids-api/internal/errors"
+	"orchids-api/internal/grok"
+	"orchids-api/internal/middleware"
 	"orchids-api/internal/orchids"
-	"orchids-api/internal/prompt"
+	"orchids-api/internal/puter"
 	"orchids-api/internal/store"
 	"orchids-api/internal/tokencache"
+	"orchids-api/internal/util"
 	"orchids-api/internal/warp"
 )
 
 type API struct {
 	store        *store.Store
-	summaryCache prompt.SummaryCache
 	tokenCache   tokencache.Cache
+	promptCache  tokencache.PromptCache
 	adminUser    string
 	adminPass    string
-	configMu     sync.RWMutex
-	config       interface{} // Using interface{} to avoid circular dependency if any, or just use *config.Config
-	configPath   string      // Path to config.json
+	loginLimiter *middleware.RateLimiter
+	config       atomic.Pointer[config.Config]
+
+	// Account check backoff / storm control
+	checkMu          sync.Mutex
+	checkInFlight    map[int64]bool
+	checkFailCount   map[int64]int
+	checkNextAllowed map[int64]time.Time
+	checkSem         chan struct{}
+}
+
+var orchidsGetAccountToken = func(acc *store.Account, cfg *config.Config) (string, error) {
+	return orchids.NewFromAccount(acc, cfg).GetToken()
+}
+
+var orchidsGetAccountChatToken = func(acc *store.Account, cfg *config.Config) (string, error) {
+	return orchids.NewFromAccount(acc, cfg).GetChatToken()
+}
+
+var orchidsFetchCredits = orchids.FetchCreditsWithProxy
+
+var boltFetchRootData = func(ctx context.Context, acc *store.Account, cfg *config.Config) (*bolt.RootData, error) {
+	client := bolt.NewFromAccount(acc, cfg)
+	defer client.Close()
+	return client.FetchRootData(ctx)
+}
+
+var boltFetchRateLimits = func(ctx context.Context, acc *store.Account, cfg *config.Config, organizationID int64) (*bolt.RateLimits, error) {
+	client := bolt.NewFromAccount(acc, cfg)
+	defer client.Close()
+	return client.FetchRateLimits(ctx, organizationID)
+}
+
+var puterVerifyAccount = func(ctx context.Context, acc *store.Account, cfg *config.Config) error {
+	client := puter.NewFromAccount(acc, cfg)
+	defer client.Close()
+	return client.VerifyAuthToken(ctx)
+}
+
+func normalizeGrokVerifyModelID(raw string) string {
+	model := strings.TrimSpace(raw)
+	if model == "" {
+		return "grok-3"
+	}
+	lower := strings.ToLower(model)
+	if lower == "grok" || !strings.HasPrefix(lower, "grok-") {
+		return "grok-3"
+	}
+	return model
+}
+
+func isGrokModelNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "model is not found") || strings.Contains(lower, "model not found")
 }
 
 func normalizeWarpTokenInput(acc *store.Account) {
 	if acc == nil || !strings.EqualFold(acc.AccountType, "warp") {
 		return
 	}
-	if acc.RefreshToken == "" && acc.ClientCookie != "" {
-		acc.RefreshToken = acc.ClientCookie
-	}
+	acc.RefreshToken = warp.ResolveRefreshToken(acc)
 	// Warp 只使用 refresh_token，清理 client_cookie 避免混用
+	acc.Token = ""
 	acc.ClientCookie = ""
 	acc.SessionCookie = ""
 }
@@ -53,13 +116,596 @@ func normalizeWarpTokenOutput(acc *store.Account) *store.Account {
 	}
 	copyAcc := *acc
 	if strings.EqualFold(copyAcc.AccountType, "warp") {
-		if copyAcc.RefreshToken == "" && copyAcc.ClientCookie != "" {
-			copyAcc.RefreshToken = copyAcc.ClientCookie
-		}
+		copyAcc.RefreshToken = warp.ResolveRefreshToken(&copyAcc)
+		// Warp 对外只暴露 refresh_token，避免把运行时 JWT 当成用户凭据回填到前端。
+		copyAcc.Token = ""
 		copyAcc.ClientCookie = ""
 		copyAcc.SessionCookie = ""
 	}
 	return &copyAcc
+}
+
+// classifyAccountStatusFromError delegates to the centralized errors package.
+func classifyAccountStatusFromError(errStr string) string {
+	return apperrors.ClassifyAccountStatus(errStr)
+}
+
+func httpStatusFromAccountStatus(status string) int {
+	switch strings.TrimSpace(status) {
+	case "401":
+		return http.StatusUnauthorized
+	case "402":
+		return http.StatusPaymentRequired
+	case "403":
+		return http.StatusForbidden
+	case "404":
+		return http.StatusNotFound
+	case "429":
+		return http.StatusTooManyRequests
+	default:
+		return http.StatusBadGateway
+	}
+}
+
+func normalizeGrokTokenInput(acc *store.Account) {
+	if acc == nil || !strings.EqualFold(acc.AccountType, "grok") {
+		return
+	}
+	raw := strings.TrimSpace(acc.ClientCookie)
+	if raw == "" {
+		raw = strings.TrimSpace(acc.RefreshToken)
+	}
+	acc.ClientCookie = grok.NormalizeSSOToken(raw)
+	// Grok only needs SSO token; clear unrelated fields.
+	acc.RefreshToken = ""
+	acc.SessionCookie = ""
+	acc.SessionID = ""
+	acc.ClientUat = ""
+	acc.ProjectID = ""
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func normalizeOrchidsCredentialInput(acc *store.Account) error {
+	if acc == nil || !strings.EqualFold(acc.AccountType, "orchids") {
+		return nil
+	}
+
+	raw := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(acc.ClientCookie), "Bearer "))
+	if raw == "" {
+		return nil
+	}
+
+	if parsed, ok, err := clerk.ParseOrchidsCookies(raw); err != nil {
+		return fmt.Errorf("invalid orchids cookies: %w", err)
+	} else if ok {
+		acc.ClientCookie = strings.TrimSpace(parsed.ClientCookie)
+		acc.ClientUat = strings.TrimSpace(parsed.ClientUat)
+		if sessionJWT := strings.TrimSpace(parsed.SessionCookie); sessionJWT != "" {
+			acc.SessionCookie = sessionJWT
+			if sid, sub := clerk.ParseSessionInfoFromJWT(sessionJWT); sid != "" {
+				acc.SessionID = sid
+				if acc.UserID == "" {
+					acc.UserID = sub
+				}
+			}
+			if strings.TrimSpace(acc.ClientCookie) == "" {
+				acc.Token = sessionJWT
+			}
+		}
+		return nil
+	}
+
+	if isLikelyJWT(raw) {
+		if jwtHasRotatingToken(raw) {
+			acc.ClientCookie = raw
+			acc.SessionCookie = ""
+			acc.SessionID = ""
+			acc.Token = ""
+			return nil
+		}
+		acc.Token = raw
+		acc.ClientCookie = ""
+		acc.SessionCookie = raw
+		if sid, sub := clerk.ParseSessionInfoFromJWT(raw); sid != "" {
+			acc.SessionID = sid
+			if acc.UserID == "" {
+				acc.UserID = sub
+			}
+		}
+		return nil
+	}
+
+	clientJWT, sessionJWT, err := clerk.ParseClientCookies(raw)
+	if err != nil {
+		return err
+	}
+	acc.ClientCookie = clientJWT
+	if sessionJWT != "" {
+		acc.SessionCookie = sessionJWT
+		if sid, sub := clerk.ParseSessionInfoFromJWT(sessionJWT); sid != "" {
+			acc.SessionID = sid
+			if acc.UserID == "" {
+				acc.UserID = sub
+			}
+		}
+	}
+	return nil
+}
+
+func normalizeAccountOutput(acc *store.Account) *store.Account {
+	out := normalizeWarpTokenOutput(acc)
+	if out == nil {
+		return nil
+	}
+	if strings.EqualFold(out.AccountType, "grok") {
+		out.RefreshToken = ""
+		out.SessionCookie = ""
+	}
+	return out
+}
+
+func normalizedAccountCredentialKey(acc *store.Account) string {
+	if acc == nil {
+		return ""
+	}
+
+	accountType := strings.ToLower(strings.TrimSpace(acc.AccountType))
+	var token string
+
+	switch accountType {
+	case "warp":
+		token = strings.TrimSpace(warp.ResolveRefreshToken(acc))
+	case "grok":
+		token = grok.NormalizeSSOToken(firstNonEmptyString(acc.ClientCookie, acc.RefreshToken, acc.Token))
+	case "bolt":
+		token = strings.TrimSpace(firstNonEmptyString(acc.SessionCookie, acc.ClientCookie, acc.Token))
+	case "puter":
+		token = strings.TrimSpace(firstNonEmptyString(acc.SessionCookie, acc.ClientCookie, acc.Token))
+	case "orchids":
+		token = strings.TrimSpace(firstNonEmptyString(acc.SessionCookie, acc.ClientCookie, acc.Token))
+	default:
+		token = strings.TrimSpace(firstNonEmptyString(acc.RefreshToken, acc.SessionCookie, acc.ClientCookie, acc.Token))
+	}
+
+	if token == "" || accountType == "" {
+		return ""
+	}
+	return accountType + ":" + token
+}
+
+func (a *API) findDuplicateAccountByCredential(ctx context.Context, acc *store.Account, excludeID int64) (*store.Account, error) {
+	if a == nil || a.store == nil || acc == nil {
+		return nil, nil
+	}
+
+	key := normalizedAccountCredentialKey(acc)
+	if key == "" {
+		return nil, nil
+	}
+
+	accounts, err := a.store.ListAccounts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, existing := range accounts {
+		if existing == nil || existing.ID == excludeID {
+			continue
+		}
+		if normalizedAccountCredentialKey(existing) == key {
+			return existing, nil
+		}
+	}
+	return nil, nil
+}
+
+func duplicateAccountError(existing *store.Account) error {
+	if existing == nil {
+		return fmt.Errorf("duplicate account token")
+	}
+	accountType := strings.TrimSpace(existing.AccountType)
+	if accountType == "" {
+		accountType = "account"
+	}
+	return fmt.Errorf("duplicate %s token already exists on account #%d", accountType, existing.ID)
+}
+
+func hasOrchidsCredentials(acc *store.Account) bool {
+	if acc == nil || !strings.EqualFold(strings.TrimSpace(acc.AccountType), "orchids") {
+		return false
+	}
+	return strings.TrimSpace(acc.ClientCookie) != "" ||
+		strings.TrimSpace(acc.SessionCookie) != "" ||
+		strings.TrimSpace(acc.Token) != ""
+}
+
+func shouldHydrateOrchidsAccountInfo(acc *store.Account, force bool) bool {
+	if !hasOrchidsCredentials(acc) {
+		return false
+	}
+	if force {
+		return true
+	}
+	return strings.TrimSpace(acc.SessionID) == "" ||
+		strings.TrimSpace(acc.ClientCookie) == "" ||
+		strings.TrimSpace(acc.ClientUat) == "" ||
+		strings.TrimSpace(acc.ProjectID) == "" ||
+		strings.TrimSpace(acc.UserID) == "" ||
+		strings.TrimSpace(acc.Email) == "" ||
+		strings.TrimSpace(acc.Token) == ""
+}
+
+func hydrateOrchidsAccountInfo(acc *store.Account, cfg *config.Config, force bool) error {
+	if !shouldHydrateOrchidsAccountInfo(acc, force) {
+		return nil
+	}
+
+	token, err := orchidsGetAccountToken(acc, cfg)
+	if err != nil {
+		return err
+	}
+	if tok := strings.TrimSpace(token); tok != "" {
+		acc.Token = tok
+		if sid, sub := clerk.ParseSessionInfoFromJWT(tok); sid != "" || sub != "" {
+			acc.SessionID = sid
+			acc.UserID = sub
+		}
+	}
+	acc.StatusCode = ""
+	acc.LastAttempt = time.Time{}
+	return nil
+}
+
+func buildQuotaResponseFields(acc *store.Account) map[string]interface{} {
+	fields := map[string]interface{}{
+		"quota_limit":     0.0,
+		"quota_used":      0.0,
+		"quota_remaining": 0.0,
+		"quota_mode":      "remaining",
+		"quota_unit":      "credits",
+		"quota_supported": true,
+	}
+	if acc == nil {
+		return fields
+	}
+
+	limit := acc.UsageLimit
+	current := acc.UsageCurrent
+	if limit < 0 {
+		limit = 0
+	}
+	if current < 0 {
+		current = 0
+	}
+
+	switch strings.ToLower(strings.TrimSpace(acc.AccountType)) {
+	case "grok":
+		limit = grok.InferQuotaLimit(acc)
+		remaining := current
+		if remaining > limit && limit > 0 {
+			limit = remaining
+		}
+		used := limit - remaining
+		if used < 0 {
+			used = 0
+		}
+		fields["quota_limit"] = limit
+		fields["quota_used"] = used
+		fields["quota_remaining"] = remaining
+		fields["quota_mode"] = "remaining"
+		fields["quota_unit"] = "requests"
+	case "warp":
+		baseLimit := limit
+		if acc.WarpMonthlyLimit > 0 {
+			baseLimit = acc.WarpMonthlyLimit
+		}
+		used := current
+		if used > baseLimit && baseLimit > 0 {
+			used = baseLimit
+		}
+		baseRemaining := acc.WarpMonthlyRemaining
+		if baseRemaining <= 0 && baseLimit > 0 {
+			baseRemaining = baseLimit - current
+		}
+		if baseRemaining < 0 {
+			baseRemaining = 0
+		}
+		bonusRemaining := acc.WarpBonusRemaining
+		if bonusRemaining < 0 {
+			bonusRemaining = 0
+		}
+		remaining := baseRemaining + bonusRemaining
+		fields["quota_limit"] = baseLimit
+		fields["quota_used"] = used
+		fields["quota_remaining"] = remaining
+		fields["quota_mode"] = "warp_split"
+		fields["quota_unit"] = "requests"
+		fields["quota_base_limit"] = baseLimit
+		fields["quota_base_remaining"] = baseRemaining
+		fields["quota_bonus_remaining"] = bonusRemaining
+	case "puter":
+		fields["quota_limit"] = 0.0
+		fields["quota_used"] = 0.0
+		fields["quota_remaining"] = 0.0
+		fields["quota_mode"] = "unknown"
+		fields["quota_unit"] = "credits"
+		fields["quota_supported"] = false
+	default:
+		fields["quota_limit"] = limit
+		remaining := current
+		if remaining > limit && limit > 0 {
+			remaining = limit
+		}
+		used := limit - remaining
+		if used < 0 {
+			used = 0
+		}
+		fields["quota_used"] = used
+		fields["quota_remaining"] = remaining
+	}
+
+	return fields
+}
+
+func orchidsCreditsToken(acc *store.Account) string {
+	if acc == nil {
+		return ""
+	}
+	if sessionJWT := strings.TrimSpace(acc.SessionCookie); sessionJWT != "" {
+		return sessionJWT
+	}
+	tok := strings.TrimSpace(acc.Token)
+	if tok == "" {
+		return ""
+	}
+	if tok == strings.TrimSpace(acc.ClientCookie) {
+		return ""
+	}
+	return tok
+}
+
+func applyOrchidsQuotaFromCredits(acc *store.Account, creditsInfo *orchids.CreditsInfo) {
+	if acc == nil || creditsInfo == nil {
+		return
+	}
+	acc.Subscription = strings.ToLower(creditsInfo.Plan)
+	acc.UsageCurrent = creditsInfo.Credits
+	acc.UsageLimit = orchids.PlanCreditLimit(creditsInfo.Plan)
+}
+
+func isNonFatalOrchidsCreditsRefreshError(err error) bool {
+	if err == nil {
+		return false
+	}
+	switch classifyAccountStatusFromError(err.Error()) {
+	case "401", "403", "429":
+		return false
+	default:
+		return true
+	}
+}
+
+func (a *API) refreshAccountState(ctx context.Context, acc *store.Account) (string, int, error) {
+	if acc == nil {
+		return "", http.StatusBadRequest, fmt.Errorf("account is nil")
+	}
+
+	if strings.EqualFold(acc.AccountType, "warp") {
+		cfg := a.config.Load()
+		warpClient := warp.NewFromAccount(acc, cfg)
+		jwt, err := warpClient.ForceRefreshAccount(ctx)
+		if err != nil {
+			httpStatus := http.StatusBadRequest
+			if code := warp.HTTPStatusCode(err); code >= 400 {
+				httpStatus = code
+			}
+			accountStatus := ""
+			if httpStatus == http.StatusUnauthorized || httpStatus == http.StatusForbidden || httpStatus == http.StatusTooManyRequests {
+				accountStatus = strconv.Itoa(httpStatus)
+			}
+			return accountStatus, httpStatus, fmt.Errorf("Failed to refresh warp account: %w", err)
+		}
+		acc.Token = jwt
+		warpClient.SyncAccountState()
+
+		limitCtx, limitCancel := context.WithTimeout(ctx, 15*time.Second)
+		limitInfo, bonuses, limitErr := warpClient.GetRequestLimitInfo(limitCtx)
+		limitCancel()
+		if limitErr == nil && limitInfo != nil {
+			if planTier := strings.ToLower(strings.TrimSpace(limitInfo.PlanTier)); planTier != "" {
+				acc.Subscription = planTier
+			} else if planName := strings.ToLower(strings.TrimSpace(limitInfo.PlanName)); planName != "" {
+				acc.Subscription = planName
+			} else if limitInfo.IsUnlimited {
+				acc.Subscription = "unlimited"
+			} else if strings.TrimSpace(acc.Subscription) == "" {
+				acc.Subscription = "free"
+			}
+			monthlyLimit := float64(limitInfo.RequestLimit)
+			bonusRemaining := 0.0
+			for _, bg := range bonuses {
+				if bg.RequestCreditsRemaining > 0 {
+					bonusRemaining += float64(bg.RequestCreditsRemaining)
+				}
+			}
+			usedRequests := float64(limitInfo.RequestsUsedSinceLastRefresh)
+			monthlyRemaining := monthlyLimit - usedRequests
+			if monthlyRemaining < 0 {
+				monthlyRemaining = 0
+			}
+			acc.UsageLimit = monthlyLimit
+			acc.UsageCurrent = usedRequests
+			acc.WarpMonthlyLimit = monthlyLimit
+			acc.WarpMonthlyRemaining = monthlyRemaining
+			acc.WarpBonusRemaining = bonusRemaining
+			if limitInfo.NextRefreshTime != "" {
+				if t, err := time.Parse(time.RFC3339, limitInfo.NextRefreshTime); err == nil {
+					acc.QuotaResetAt = t
+				}
+			}
+		} else if limitErr != nil {
+			slog.Warn("Warp quota sync failed after refresh; keeping account available", "account_id", acc.ID, "error", limitErr)
+		}
+		return "", 0, nil
+	}
+
+	if strings.EqualFold(acc.AccountType, "grok") {
+		if strings.TrimSpace(acc.ClientCookie) == "" {
+			return "", http.StatusBadRequest, fmt.Errorf("Failed to verify grok account: missing sso token")
+		}
+
+		cfg := a.config.Load()
+		client := grok.New(cfg)
+
+		modelID := normalizeGrokVerifyModelID(acc.AgentMode)
+		if modelID != "" && modelID != acc.AgentMode {
+			acc.AgentMode = modelID
+		}
+
+		verifyCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		info, verifyErr := client.VerifyToken(verifyCtx, acc.ClientCookie, modelID)
+		cancel()
+		if verifyErr != nil && isGrokModelNotFound(verifyErr) && modelID != "grok-3" {
+			modelID = "grok-3"
+			acc.AgentMode = modelID
+			verifyCtx, cancel = context.WithTimeout(ctx, 20*time.Second)
+			info, verifyErr = client.VerifyToken(verifyCtx, acc.ClientCookie, modelID)
+			cancel()
+		}
+		if verifyErr != nil {
+			status := classifyAccountStatusFromError(verifyErr.Error())
+			return status, httpStatusFromAccountStatus(status), fmt.Errorf("Failed to verify grok account: %w", verifyErr)
+		}
+
+		if info != nil {
+			grok.ApplyQuotaInfo(acc, info)
+		}
+		return "", 0, nil
+	}
+
+	if strings.EqualFold(acc.AccountType, "bolt") {
+		if strings.TrimSpace(acc.SessionCookie) == "" && strings.TrimSpace(acc.ClientCookie) == "" {
+			return "", http.StatusBadRequest, fmt.Errorf("Failed to verify bolt account: missing session token")
+		}
+		if strings.TrimSpace(acc.ProjectID) == "" {
+			return "", http.StatusBadRequest, fmt.Errorf("Failed to verify bolt account: missing project id")
+		}
+
+		rootData, err := boltFetchRootData(ctx, acc, a.config.Load())
+		if err != nil {
+			status := classifyAccountStatusFromError(err.Error())
+			httpStatus := http.StatusBadGateway
+			if status != "" {
+				httpStatus = httpStatusFromAccountStatus(status)
+			}
+			return status, httpStatus, fmt.Errorf("Failed to verify bolt account: %w", err)
+		}
+		bolt.ApplyRootData(acc, rootData)
+		if rootData != nil && rootData.User != nil {
+			rateLimits, rateErr := boltFetchRateLimits(ctx, acc, a.config.Load(), rootData.User.ActiveOrganizationID)
+			if rateErr != nil {
+				slog.Warn("Bolt quota sync fallback to root data", "account_id", acc.ID, "error", rateErr)
+			} else {
+				bolt.ApplyRateLimits(acc, rateLimits)
+			}
+		}
+		return "", 0, nil
+	}
+
+	if strings.EqualFold(acc.AccountType, "puter") {
+		if strings.TrimSpace(acc.ClientCookie) == "" &&
+			strings.TrimSpace(acc.Token) == "" &&
+			strings.TrimSpace(acc.SessionCookie) == "" {
+			return "", http.StatusBadRequest, fmt.Errorf("Failed to verify puter account: missing auth token")
+		}
+		if err := puterVerifyAccount(ctx, acc, a.config.Load()); err != nil {
+			status := classifyAccountStatusFromError(err.Error())
+			httpStatus := http.StatusBadGateway
+			if status != "" {
+				httpStatus = httpStatusFromAccountStatus(status)
+			}
+			return status, httpStatus, fmt.Errorf("Failed to verify puter account: %w", err)
+		}
+		return "", 0, nil
+	}
+
+	cfg := a.config.Load()
+	proxyFunc := util.ProxyFuncFromConfig(cfg)
+
+	jwt, err := orchidsGetAccountToken(acc, cfg)
+	if err != nil {
+		status := classifyAccountStatusFromError(err.Error())
+		httpStatus := http.StatusBadRequest
+		if status != "" {
+			httpStatus = httpStatusFromAccountStatus(status)
+		}
+		if strings.TrimSpace(acc.ClientCookie) == "" &&
+			strings.TrimSpace(acc.SessionCookie) == "" &&
+			strings.TrimSpace(acc.Token) == "" {
+			httpStatus = http.StatusBadRequest
+		}
+
+		// Keep quota display usable for session-only Orchids accounts:
+		// even when chat auth cannot be established, the Clerk session JWT may
+		// still be enough to read credits.
+		quotaSynced := false
+		if creditsJWT := orchidsCreditsToken(acc); creditsJWT != "" {
+			if sid, sub := clerk.ParseSessionInfoFromJWT(creditsJWT); sub != "" {
+				if acc.SessionID == "" && sid != "" {
+					acc.SessionID = sid
+				}
+				if acc.UserID == "" {
+					acc.UserID = sub
+				}
+			}
+			if strings.TrimSpace(acc.UserID) != "" {
+				if creditsInfo, creditsErr := orchidsFetchCredits(ctx, creditsJWT, acc.UserID, proxyFunc); creditsErr == nil {
+					applyOrchidsQuotaFromCredits(acc, creditsInfo)
+					quotaSynced = true
+				} else {
+					slog.Warn("Orchids quota fallback failed after chat auth failure", "account_id", acc.ID, "error", creditsErr)
+				}
+			}
+		}
+		if quotaSynced {
+			slog.Warn("Orchids chat auth refresh failed but quota sync succeeded; keeping account refresh successful", "account_id", acc.ID, "status", status, "error", err)
+			return "", 0, nil
+		}
+		return status, httpStatus, fmt.Errorf("Failed to refresh account: %w", err)
+	}
+
+	acc.Token = strings.TrimSpace(jwt)
+	if sid, sub := clerk.ParseSessionInfoFromJWT(acc.Token); sub != "" {
+		if acc.SessionID == "" && sid != "" {
+			acc.SessionID = sid
+		}
+		if acc.UserID == "" {
+			acc.UserID = sub
+		}
+	}
+
+	creditsInfo, creditsErr := orchidsFetchCredits(ctx, acc.Token, acc.UserID, proxyFunc)
+	if creditsErr != nil {
+		if isNonFatalOrchidsCreditsRefreshError(creditsErr) {
+			slog.Warn("Orchids quota refresh skipped due to upstream server action mismatch; keeping auth refresh successful", "account_id", acc.ID, "error", creditsErr)
+			return "", 0, nil
+		}
+		status := classifyAccountStatusFromError(creditsErr.Error())
+		httpStatus := http.StatusBadRequest
+		if status != "" {
+			httpStatus = httpStatusFromAccountStatus(status)
+		}
+		return status, httpStatus, fmt.Errorf("Failed to refresh account: %w", creditsErr)
+	}
+	applyOrchidsQuotaFromCredits(acc, creditsInfo)
+	return "", 0, nil
 }
 
 type ExportData struct {
@@ -88,19 +734,41 @@ type UpdateKeyRequest struct {
 	Enabled *bool `json:"enabled"`
 }
 
-func New(s *store.Store, adminUser, adminPass string, cfg interface{}, cfgPath string) *API {
-	return &API{
-		store:      s,
-		adminUser:  adminUser,
-		adminPass:  adminPass,
-		config:     cfg,
-		configPath: cfgPath,
+func New(s *store.Store, adminUser, adminPass string, cfg *config.Config) *API {
+	a := &API{
+		store:        s,
+		adminUser:    adminUser,
+		adminPass:    adminPass,
+		loginLimiter: middleware.NewRateLimiter(5, 15*time.Minute),
+
+		checkInFlight:    map[int64]bool{},
+		checkFailCount:   map[int64]int{},
+		checkNextAllowed: map[int64]time.Time{},
+		checkSem:         make(chan struct{}, 2),
 	}
+	if cfg != nil {
+		a.config.Store(cfg)
+	}
+	return a
+}
+
+func (a *API) SetPromptCache(cache tokencache.PromptCache) {
+	a.promptCache = cache
+}
+
+func secureCompare(a, b string) bool {
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 
 func (a *API) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	ip := middleware.ExtractIP(r.RemoteAddr, r.Header.Get("X-Forwarded-For"), r.Header.Get("X-Real-IP"))
+	if a.loginLimiter != nil && !a.loginLimiter.Allow(ip) {
+		http.Error(w, "Too many login attempts, try again later", http.StatusTooManyRequests)
 		return
 	}
 
@@ -113,7 +781,14 @@ func (a *API) HandleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Username != a.adminUser || req.Password != a.adminPass {
+	adminUser := a.adminUser
+	adminPass := a.adminPass
+	if cfg := a.config.Load(); cfg != nil {
+		adminUser = cfg.AdminUser
+		adminPass = cfg.AdminPass
+	}
+
+	if !secureCompare(req.Username, adminUser) || !secureCompare(req.Password, adminPass) {
 		http.Error(w, "Invalid credentials", http.StatusUnauthorized)
 		return
 	}
@@ -125,12 +800,17 @@ func (a *API) HandleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// NOTE: Do not mark cookies as Secure when served over plain HTTP,
+	// otherwise browsers will drop the cookie and the Admin UI will appear unable to log in.
+	// When behind a TLS-terminating proxy, honor X-Forwarded-Proto.
+	isHTTPS := r.TLS != nil || strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https")
+
 	http.SetCookie(w, &http.Cookie{
 		Name:     "session_token",
 		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
-		Secure:   true,
+		Secure:   isHTTPS,
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   86400 * 7,
 	})
@@ -161,39 +841,77 @@ func (a *API) HandleConfig(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
-		a.configMu.RLock()
-		json.NewEncoder(w).Encode(a.config)
-		a.configMu.RUnlock()
+		json.NewEncoder(w).Encode(a.config.Load())
 	case http.MethodPost:
-		// Update config under write lock
-		a.configMu.Lock()
-		if err := json.NewDecoder(r.Body).Decode(a.config); err != nil {
-			a.configMu.Unlock()
+		// Copy current config, decode into copy, then atomically store
+		current := a.config.Load()
+		newCfg := *current
+		if err := json.NewDecoder(r.Body).Decode(&newCfg); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-
-		// Save to Redis
-		data, err := json.Marshal(a.config)
-		if err != nil {
-			a.configMu.Unlock()
-			http.Error(w, "Failed to marshal config: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		a.configMu.Unlock()
-
-		if err := a.store.SetSetting(r.Context(), "config", string(data)); err != nil {
-			http.Error(w, "Failed to save config to Redis: "+err.Error(), http.StatusInternalServerError)
+		if err := a.persistConfig(r.Context(), current, &newCfg); err != nil {
+			http.Error(w, "Failed to save config: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 
-		a.configMu.RLock()
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(a.config)
-		a.configMu.RUnlock()
+		json.NewEncoder(w).Encode(&newCfg)
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+func (a *API) HandleConfigList(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+
+	data, err := configPayload(a.config.Load())
+	if err != nil {
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"code": 1,
+			"msg":  "获取配置失败: " + err.Error(),
+		})
+		return
+	}
+
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"code": 0,
+		"data": data,
+	})
+}
+
+func (a *API) HandleConfigSave(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+
+	current := a.config.Load()
+	newCfg, err := buildConfigFromPatch(r, current)
+	if err != nil {
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"code": 1,
+			"msg":  "parse request failed: " + err.Error(),
+		})
+		return
+	}
+	if err := a.persistConfig(r.Context(), current, newCfg); err != nil {
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"code": 1,
+			"msg":  "save config failed: " + err.Error(),
+		})
+		return
+	}
+
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"code": 0,
+		"msg":  "success",
+	})
 }
 
 func (a *API) HandleAccounts(w http.ResponseWriter, r *http.Request) {
@@ -211,7 +929,13 @@ func (a *API) HandleAccounts(w http.ResponseWriter, r *http.Request) {
 		}
 		normalized := make([]*store.Account, 0, len(accounts))
 		for _, acc := range accounts {
-			normalized = append(normalized, normalizeWarpTokenOutput(acc))
+			if acc == nil {
+				continue
+			}
+			if strings.EqualFold(strings.TrimSpace(acc.AccountType), "v0") || strings.EqualFold(strings.TrimSpace(acc.AccountType), "v0-web") {
+				continue
+			}
+			normalized = append(normalized, normalizeAccountOutput(acc))
 		}
 		json.NewEncoder(w).Encode(normalized)
 
@@ -224,41 +948,31 @@ func (a *API) HandleAccounts(w http.ResponseWriter, r *http.Request) {
 		if strings.TrimSpace(acc.AccountType) == "" {
 			acc.AccountType = "orchids"
 		}
+		orchidsCredentialInput := hasOrchidsCredentials(&acc)
 		if strings.EqualFold(acc.AccountType, "warp") {
 			normalizeWarpTokenInput(&acc)
+		} else if strings.EqualFold(acc.AccountType, "grok") {
+			normalizeGrokTokenInput(&acc)
 		} else if acc.ClientCookie != "" {
-			clientJWT, sessionJWT, err := clerk.ParseClientCookies(acc.ClientCookie)
-			if err != nil {
+			if err := normalizeOrchidsCredentialInput(&acc); err != nil {
 				http.Error(w, "Invalid client cookie: "+err.Error(), http.StatusBadRequest)
 				return
 			}
-			acc.ClientCookie = clientJWT
-			if sessionJWT != "" {
-				acc.SessionCookie = sessionJWT
-				if acc.SessionID == "" {
-					if sid, sub := clerk.ParseSessionInfoFromJWT(sessionJWT); sid != "" {
-						acc.SessionID = sid
-						if acc.UserID == "" {
-							acc.UserID = sub
-						}
-					}
-				}
+		}
+		if strings.EqualFold(acc.AccountType, "orchids") {
+			err := hydrateOrchidsAccountInfo(&acc, a.config.Load(), orchidsCredentialInput)
+			if err != nil {
+				applyAccountStatusFromError(&acc, err)
+				slog.Warn("Failed to fetch account info, saving without session data", "error", err)
 			}
 		}
-		if acc.ClientCookie != "" && acc.SessionID == "" && !strings.EqualFold(acc.AccountType, "warp") {
-			info, err := clerk.FetchAccountInfoWithSession(acc.ClientCookie, acc.SessionCookie)
-			if err != nil {
-				slog.Warn("Failed to fetch account info, saving without session data", "error", err)
-			} else {
-				acc.SessionID = info.SessionID
-				acc.ClientUat = info.ClientUat
-				acc.ProjectID = info.ProjectID
-				acc.UserID = info.UserID
-				acc.Email = info.Email
-				if info.ClientCookie != "" {
-					acc.ClientCookie = info.ClientCookie
-				}
-			}
+		if existing, err := a.findDuplicateAccountByCredential(r.Context(), &acc, 0); err != nil {
+			slog.Error("Failed to detect duplicate account token", "error", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		} else if existing != nil {
+			http.Error(w, duplicateAccountError(existing).Error(), http.StatusConflict)
+			return
 		}
 
 		if err := a.store.CreateAccount(r.Context(), &acc); err != nil {
@@ -267,8 +981,31 @@ func (a *API) HandleAccounts(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		if acc.Enabled && shouldSyncAccountOnCreate(&acc) {
+			if wantsAsyncAccountSync(r) {
+				a.syncAccountAfterCreate(acc)
+			} else {
+				syncCtx, syncCancel := context.WithTimeout(r.Context(), 25*time.Second)
+				accountStatus, _, syncErr := a.refreshAccountState(syncCtx, &acc)
+				syncCancel()
+				if syncErr != nil {
+					slog.Warn("Initial account sync failed", "account_id", acc.ID, "type", acc.AccountType, "error", syncErr)
+					if accountStatus != "" {
+						acc.StatusCode = accountStatus
+						acc.LastAttempt = time.Now()
+					}
+				} else {
+					acc.StatusCode = ""
+					acc.LastAttempt = time.Time{}
+				}
+				if updateErr := a.store.UpdateAccount(r.Context(), &acc); updateErr != nil {
+					slog.Warn("Failed to persist initial account sync", "account_id", acc.ID, "type", acc.AccountType, "error", updateErr)
+				}
+			}
+		}
+
 		w.WriteHeader(http.StatusCreated)
-		json.NewEncoder(w).Encode(normalizeWarpTokenOutput(&acc))
+		json.NewEncoder(w).Encode(normalizeAccountOutput(&acc))
 
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -287,107 +1024,128 @@ func (a *API) HandleAccountByID(w http.ResponseWriter, r *http.Request) {
 	}
 
 	isRefresh := len(parts) > 1 && parts[1] == "refresh"
+	isVerify := len(parts) > 1 && parts[1] == "verify"
+	isCheck := len(parts) > 1 && parts[1] == "check"
 	isUsage := len(parts) > 1 && parts[1] == "usage"
 
 	switch r.Method {
 	case http.MethodGet:
+		if isRefresh || isVerify {
+			http.Error(w, "Deprecated endpoint. Use /api/accounts/{id}/check instead.", http.StatusGone)
+			return
+		}
 		if isUsage {
 			acc, err := a.store.GetAccount(r.Context(), id)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusNotFound)
 				return
 			}
-			json.NewEncoder(w).Encode(map[string]interface{}{
+			resp := map[string]interface{}{
 				"account_id":     acc.ID,
 				"name":           acc.Name,
 				"account_type":   acc.AccountType,
 				"subscription":   acc.Subscription,
 				"usage_current":  acc.UsageCurrent,
 				"usage_limit":    acc.UsageLimit,
-				"usage_daily":    acc.UsageDaily,
 				"usage_total":    acc.UsageTotal,
 				"quota_reset_at": acc.QuotaResetAt,
-				"reset_date":     acc.ResetDate,
-			})
+			}
+			for k, v := range buildQuotaResponseFields(acc) {
+				resp[k] = v
+			}
+			json.NewEncoder(w).Encode(resp)
 			return
 		}
-		if isRefresh {
+		if isCheck {
+			// Storm control / backoff: only allow a small number of concurrent checks,
+			// and apply exponential backoff per account on failures.
+			now := time.Now()
+			a.checkMu.Lock()
+			if a.checkInFlight[id] {
+				a.checkMu.Unlock()
+				http.Error(w, "account check already in progress", http.StatusTooManyRequests)
+				return
+			}
+			if next, ok := a.checkNextAllowed[id]; ok && !next.IsZero() && now.Before(next) {
+				retryAfter := int(next.Sub(now).Seconds())
+				if retryAfter < 1 {
+					retryAfter = 1
+				}
+				a.checkMu.Unlock()
+				w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+				http.Error(w, "account check backoff", http.StatusTooManyRequests)
+				return
+			}
+			a.checkInFlight[id] = true
+			a.checkMu.Unlock()
+			defer func() {
+				a.checkMu.Lock()
+				delete(a.checkInFlight, id)
+				a.checkMu.Unlock()
+			}()
+
+			// global concurrency limit
+			a.checkSem <- struct{}{}
+			defer func() { <-a.checkSem }()
+
 			acc, err := a.store.GetAccount(r.Context(), id)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusNotFound)
 				return
 			}
-			if strings.EqualFold(acc.AccountType, "warp") {
-				var cfg *config.Config
-				a.configMu.RLock()
-				if raw, ok := a.config.(*config.Config); ok {
-					cfg = raw
-				}
-				a.configMu.RUnlock()
-				warpClient := warp.NewFromAccount(acc, cfg)
-				jwt, err := warpClient.RefreshAccount(r.Context())
-				if err != nil {
-					status := http.StatusBadRequest
-					if code := warp.HTTPStatusCode(err); code >= 400 {
-						status = code
-					}
-					http.Error(w, "Failed to refresh warp account: "+err.Error(), status)
+
+			checkOK := false
+			checkErrStatus := ""
+			defer func() {
+				a.checkMu.Lock()
+				defer a.checkMu.Unlock()
+				if checkOK {
+					a.checkFailCount[id] = 0
+					a.checkNextAllowed[id] = time.Now().Add(3 * time.Second)
 					return
 				}
-				acc.Token = jwt
-				warpClient.SyncAccountState()
-			} else {
-				info, err := clerk.FetchAccountInfoWithSession(acc.ClientCookie, acc.SessionCookie)
-				if err != nil {
-					refreshErr := err
-					// Fallback: when Clerk cannot enumerate active sessions, try session-id token endpoint.
-					if strings.Contains(strings.ToLower(err.Error()), "no active sessions found") && strings.TrimSpace(acc.SessionID) != "" {
-						var cfg *config.Config
-						a.configMu.RLock()
-						if raw, ok := a.config.(*config.Config); ok {
-							cfg = raw
-						}
-						a.configMu.RUnlock()
-
-						orchidsClient := orchids.NewFromAccount(acc, cfg)
-						jwt, jwtErr := orchidsClient.GetToken()
-						if jwtErr == nil && strings.TrimSpace(jwt) != "" {
-							acc.Token = jwt
-							refreshErr = nil
-							slog.Warn("Orchids refresh: no active sessions, fallback token refresh succeeded", "account_id", id)
-						} else if jwtErr != nil {
-							refreshErr = errors.New(err.Error() + "; fallback token error: " + jwtErr.Error())
-						}
-					}
-
-					if refreshErr != nil {
-						http.Error(w, "Failed to refresh account: "+refreshErr.Error(), http.StatusBadRequest)
-						return
-					}
-				} else {
-					slog.Info("Orchids refresh: clerk info", "account_id", id, "has_jwt", info.JWT != "", "email", info.Email)
-					acc.SessionID = info.SessionID
-					acc.ClientUat = info.ClientUat
-					acc.ProjectID = info.ProjectID
-					acc.UserID = info.UserID
-					acc.Email = info.Email
-					acc.Token = info.JWT // Update Token/JWT
-					if info.ClientCookie != "" {
-						acc.ClientCookie = info.ClientCookie
+				fails := a.checkFailCount[id] + 1
+				a.checkFailCount[id] = fails
+				d := time.Duration(1<<util.MinInt(fails, 8)) * time.Second
+				// For CF/rate-limit style failures, start with a bigger cooldown.
+				if checkErrStatus == "403" || checkErrStatus == "429" {
+					if d < 60*time.Second {
+						d = 60 * time.Second
 					}
 				}
-			}
+				if d > 10*time.Minute {
+					d = 10 * time.Minute
+				}
+				a.checkNextAllowed[id] = time.Now().Add(d)
+			}()
 
-			// 刷新成功后清理账号状态
-			acc.StatusCode = ""
-			acc.LastAttempt = time.Time{}
-			acc.QuotaResetAt = time.Time{}
-
-			if err := a.store.UpdateAccount(r.Context(), acc); err != nil {
-				http.Error(w, "Failed to save refreshed account: "+err.Error(), http.StatusInternalServerError)
+			accountStatus, httpStatus, refreshErr := a.refreshAccountState(r.Context(), acc)
+			if refreshErr != nil {
+				checkErrStatus = accountStatus
+				if accountStatus != "" {
+					acc.StatusCode = accountStatus
+					acc.LastAttempt = time.Now()
+					if updateErr := a.store.UpdateAccount(r.Context(), acc); updateErr != nil {
+						slog.Warn("Failed to persist account refresh status", "account_id", acc.ID, "error", updateErr)
+					}
+				}
+				if httpStatus == 0 {
+					httpStatus = http.StatusBadRequest
+				}
+				http.Error(w, refreshErr.Error(), httpStatus)
 				return
 			}
-			json.NewEncoder(w).Encode(normalizeWarpTokenOutput(acc))
+
+			// 刷新/验证成功后清理账号状态
+			acc.StatusCode = ""
+			acc.LastAttempt = time.Time{}
+			checkOK = true
+
+			if err := a.store.UpdateAccount(r.Context(), acc); err != nil {
+				http.Error(w, "Failed to save checked account: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			json.NewEncoder(w).Encode(normalizeAccountOutput(acc))
 			return
 		}
 		acc, err := a.store.GetAccount(r.Context(), id)
@@ -395,7 +1153,7 @@ func (a *API) HandleAccountByID(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusNotFound)
 			return
 		}
-		json.NewEncoder(w).Encode(normalizeWarpTokenOutput(acc))
+		json.NewEncoder(w).Encode(normalizeAccountOutput(acc))
 
 	case http.MethodPut:
 		existing, err := a.store.GetAccount(r.Context(), id)
@@ -416,30 +1174,31 @@ func (a *API) HandleAccountByID(w http.ResponseWriter, r *http.Request) {
 		if strings.TrimSpace(acc.AccountType) == "" {
 			acc.AccountType = "orchids"
 		}
+		orchidsCredentialInput := hasOrchidsCredentials(&acc)
 		if strings.EqualFold(acc.AccountType, "warp") {
 			normalizeWarpTokenInput(&acc)
+		} else if strings.EqualFold(acc.AccountType, "grok") {
+			normalizeGrokTokenInput(&acc)
 		} else if acc.ClientCookie != "" {
-			clientJWT, sessionJWT, err := clerk.ParseClientCookies(acc.ClientCookie)
-			if err != nil {
+			if err := normalizeOrchidsCredentialInput(&acc); err != nil {
 				http.Error(w, "Invalid client cookie: "+err.Error(), http.StatusBadRequest)
 				return
-			}
-			acc.ClientCookie = clientJWT
-			if sessionJWT != "" {
-				acc.SessionCookie = sessionJWT
-				if acc.SessionID == "" {
-					if sid, sub := clerk.ParseSessionInfoFromJWT(sessionJWT); sid != "" {
-						acc.SessionID = sid
-						if acc.UserID == "" {
-							acc.UserID = sub
-						}
-					}
-				}
 			}
 		}
 
 		if acc.SessionID == "" {
 			acc.SessionID = existing.SessionID
+		}
+		if strings.EqualFold(acc.AccountType, "warp") {
+			if strings.TrimSpace(acc.RefreshToken) == "" {
+				acc.RefreshToken = existing.RefreshToken
+			}
+			if strings.TrimSpace(acc.DeviceID) == "" {
+				acc.DeviceID = existing.DeviceID
+			}
+			if strings.TrimSpace(acc.RequestID) == "" {
+				acc.RequestID = existing.RequestID
+			}
 		}
 		if acc.SessionCookie == "" {
 			acc.SessionCookie = existing.SessionCookie
@@ -456,12 +1215,28 @@ func (a *API) HandleAccountByID(w http.ResponseWriter, r *http.Request) {
 		if acc.Email == "" {
 			acc.Email = existing.Email
 		}
+		if !acc.NSFWEnabled && existing.NSFWEnabled {
+			acc.NSFWEnabled = true
+		}
+		if strings.EqualFold(acc.AccountType, "orchids") {
+			if err := hydrateOrchidsAccountInfo(&acc, a.config.Load(), orchidsCredentialInput); err != nil {
+				applyAccountStatusFromError(&acc, err)
+				slog.Warn("Failed to refresh Orchids account info during update", "account_id", acc.ID, "error", err)
+			}
+		}
+		if duplicate, err := a.findDuplicateAccountByCredential(r.Context(), &acc, id); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		} else if duplicate != nil {
+			http.Error(w, duplicateAccountError(duplicate).Error(), http.StatusConflict)
+			return
+		}
 
 		if err := a.store.UpdateAccount(r.Context(), &acc); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		json.NewEncoder(w).Encode(normalizeWarpTokenOutput(&acc))
+		json.NewEncoder(w).Encode(normalizeAccountOutput(&acc))
 
 	case http.MethodDelete:
 		if err := a.store.DeleteAccount(r.Context(), id); err != nil {
@@ -493,7 +1268,7 @@ func (a *API) HandleExport(w http.ResponseWriter, r *http.Request) {
 		Accounts: make([]store.Account, len(accounts)),
 	}
 	for i, acc := range accounts {
-		exportData.Accounts[i] = *normalizeWarpTokenOutput(acc)
+		exportData.Accounts[i] = *normalizeAccountOutput(acc)
 		exportData.Accounts[i].ID = 0
 		exportData.Accounts[i].RequestCount = 0
 	}
@@ -525,24 +1300,13 @@ func (a *API) HandleImport(w http.ResponseWriter, r *http.Request) {
 		}
 		if strings.EqualFold(acc.AccountType, "warp") {
 			normalizeWarpTokenInput(&acc)
+		} else if strings.EqualFold(acc.AccountType, "grok") {
+			normalizeGrokTokenInput(&acc)
 		} else if acc.ClientCookie != "" {
-			clientJWT, sessionJWT, err := clerk.ParseClientCookies(acc.ClientCookie)
-			if err != nil {
+			if err := normalizeOrchidsCredentialInput(&acc); err != nil {
 				slog.Warn("Invalid client cookie in import", "name", acc.Name, "error", err)
 				result.Skipped++
 				continue
-			}
-			acc.ClientCookie = clientJWT
-			if sessionJWT != "" {
-				acc.SessionCookie = sessionJWT
-				if acc.SessionID == "" {
-					if sid, sub := clerk.ParseSessionInfoFromJWT(sessionJWT); sid != "" {
-						acc.SessionID = sid
-						if acc.UserID == "" {
-							acc.UserID = sub
-						}
-					}
-				}
 			}
 		}
 		if err := a.store.CreateAccount(r.Context(), &acc); err != nil {
@@ -703,7 +1467,17 @@ func (a *API) HandleModels(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		json.NewEncoder(w).Encode(models)
+		filtered := make([]*store.Model, 0, len(models))
+		for _, model := range models {
+			if model == nil {
+				continue
+			}
+			if strings.EqualFold(strings.TrimSpace(model.Channel), "v0") || strings.EqualFold(strings.TrimSpace(model.Channel), "v0-web") {
+				continue
+			}
+			filtered = append(filtered, model)
+		}
+		json.NewEncoder(w).Encode(filtered)
 
 	case http.MethodPost:
 		var m store.Model
@@ -773,10 +1547,6 @@ func (a *API) HandleModelByID(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (a *API) SetSummaryCache(c prompt.SummaryCache) {
-	a.summaryCache = c
-}
-
 func (a *API) SetTokenCache(c tokencache.Cache) {
 	a.tokenCache = c
 }
@@ -831,11 +1601,279 @@ func (a *API) HandleCacheClear(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) cacheTokenCountEnabled() bool {
-	a.configMu.RLock()
-	cfg, ok := a.config.(*config.Config)
-	a.configMu.RUnlock()
-	if !ok || cfg == nil {
+	cfg := a.config.Load()
+	if cfg == nil {
 		return false
 	}
 	return cfg.CacheTokenCount
+}
+
+func tokenCacheConfigChanged(before, after *config.Config) bool {
+	if before == nil || after == nil {
+		return true
+	}
+	return before.CacheTokenCount != after.CacheTokenCount ||
+		before.CacheTTL != after.CacheTTL ||
+		before.CacheStrategy != after.CacheStrategy ||
+		before.EnableTokenCache != after.EnableTokenCache ||
+		before.TokenCacheTTL != after.TokenCacheTTL ||
+		before.TokenCacheStrategy != after.TokenCacheStrategy
+}
+
+func (a *API) clearTokenCaches(ctx context.Context) {
+	if a.tokenCache != nil {
+		if err := a.tokenCache.Clear(ctx); err != nil {
+			slog.Warn("failed to clear token cache after config update", "error", err)
+		}
+	}
+	if a.promptCache != nil {
+		if err := a.promptCache.Clear(ctx); err != nil {
+			slog.Warn("failed to clear prompt cache after config update", "error", err)
+		}
+	}
+}
+
+func configPayload(cfg *config.Config) (map[string]interface{}, error) {
+	if cfg == nil {
+		return map[string]interface{}{}, nil
+	}
+
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		return nil, err
+	}
+	payload := map[string]interface{}{}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, err
+	}
+	if v, ok := payload["admin_pass"]; ok {
+		payload["admin_password"] = v
+	}
+	if rawProxyURL, ok := payload["proxy_url"].(string); (!ok || strings.TrimSpace(rawProxyURL) == "") && cfg != nil {
+		if proxyURL := util.ProxyURLFromConfig(cfg); proxyURL != nil {
+			payload["proxy_url"] = proxyURL.String()
+		}
+	}
+	return payload, nil
+}
+
+func buildConfigFromPatch(r *http.Request, current *config.Config) (*config.Config, error) {
+	base := &config.Config{}
+	if current != nil {
+		copyCfg := *current
+		base = &copyCfg
+	}
+
+	baseMap, err := configPayload(base)
+	if err != nil {
+		return nil, err
+	}
+
+	patch := map[string]interface{}{}
+	if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
+		return nil, err
+	}
+
+	if v, ok := patch["admin_password"]; ok {
+		patch["admin_pass"] = v
+	}
+
+	for key, value := range patch {
+		baseMap[key] = normalizeConfigPatchValue(key, value)
+	}
+	if _, ok := patch["proxy_url"]; ok {
+		baseMap["proxy_http"] = ""
+		baseMap["proxy_https"] = ""
+		baseMap["proxy_user"] = ""
+		baseMap["proxy_pass"] = ""
+	}
+
+	raw, err := json.Marshal(baseMap)
+	if err != nil {
+		return nil, err
+	}
+	var newCfg config.Config
+	if err := json.Unmarshal(raw, &newCfg); err != nil {
+		return nil, err
+	}
+	return &newCfg, nil
+}
+
+func normalizeConfigPatchValue(key string, value interface{}) interface{} {
+	if value == nil {
+		return nil
+	}
+
+	switch key {
+	case "enable_token_refresh", "enable_usage_refresh", "enable_token_count", "cache_token_count",
+		"enable_token_cache", "auto_refresh_token", "kiro_use_builtin_proxy", "warp_use_builtin_proxy",
+		"orchids_use_builtin_proxy", "antigravity_use_builtin_proxy", "warp_credit_refund",
+		"enable_context_compress", "debug_enabled":
+		if b, ok := parseBoolish(value); ok {
+			return b
+		}
+	case "retry_delay", "request_timeout", "refresh_interval", "cache_ttl", "token_cache_ttl",
+		"redis_db", "token_refresh_interval", "load_balancer_cache_ttl", "concurrency_limit",
+		"concurrency_timeout", "max_retries", "credential_retries":
+		if i, ok := parseIntish(value); ok {
+			return i
+		}
+	case "proxy_bypass":
+		return normalizeProxyBypassValue(value)
+	case "proxy_url":
+		return strings.TrimSpace(fmt.Sprint(value))
+	}
+
+	return value
+}
+
+func parseBoolish(value interface{}) (bool, bool) {
+	switch v := value.(type) {
+	case bool:
+		return v, true
+	case string:
+		s := strings.TrimSpace(strings.ToLower(v))
+		switch s {
+		case "true", "1", "yes", "on":
+			return true, true
+		case "false", "0", "no", "off":
+			return false, true
+		}
+	case float64:
+		return v != 0, true
+	}
+	return false, false
+}
+
+func parseIntish(value interface{}) (int, bool) {
+	switch v := value.(type) {
+	case int:
+		return v, true
+	case int64:
+		return int(v), true
+	case float64:
+		return int(v), true
+	case string:
+		n, err := strconv.Atoi(strings.TrimSpace(v))
+		if err == nil {
+			return n, true
+		}
+	}
+	return 0, false
+}
+
+func normalizeProxyBypassValue(value interface{}) []string {
+	switch v := value.(type) {
+	case []string:
+		return v
+	case []interface{}:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			s := strings.TrimSpace(fmt.Sprint(item))
+			if s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	case string:
+		lines := strings.FieldsFunc(v, func(r rune) bool {
+			return r == '\n' || r == ','
+		})
+		out := make([]string, 0, len(lines))
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line != "" {
+				out = append(out, line)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func shouldSyncAccountOnCreate(acc *store.Account) bool {
+	if acc == nil {
+		return false
+	}
+	return !strings.EqualFold(strings.TrimSpace(acc.AccountType), "orchids")
+}
+
+func wantsAsyncAccountSync(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Account-Sync")), "async")
+}
+
+func (a *API) syncAccountAfterCreate(acc store.Account) {
+	if !acc.Enabled || !shouldSyncAccountOnCreate(&acc) {
+		return
+	}
+
+	go func(account store.Account) {
+		syncCtx, syncCancel := context.WithTimeout(context.Background(), 25*time.Second)
+		defer syncCancel()
+
+		accountStatus, _, syncErr := a.refreshAccountState(syncCtx, &account)
+		if syncErr != nil {
+			slog.Warn("Initial account sync failed", "account_id", account.ID, "type", account.AccountType, "error", syncErr)
+			if accountStatus != "" {
+				account.StatusCode = accountStatus
+				account.LastAttempt = time.Now()
+			}
+		} else {
+			account.StatusCode = ""
+			account.LastAttempt = time.Time{}
+		}
+
+		if updateErr := a.store.UpdateAccount(context.Background(), &account); updateErr != nil {
+			slog.Warn("Failed to persist initial account sync", "account_id", account.ID, "type", account.AccountType, "error", updateErr)
+		}
+	}(acc)
+}
+
+func applyAccountStatusFromError(acc *store.Account, err error) {
+	if acc == nil || err == nil {
+		return
+	}
+	status := classifyAccountStatusFromError(err.Error())
+	if status == "" {
+		return
+	}
+	acc.StatusCode = status
+	acc.LastAttempt = time.Now()
+}
+
+func (a *API) persistConfig(ctx context.Context, current, newCfg *config.Config) error {
+	if newCfg == nil {
+		return fmt.Errorf("config is nil")
+	}
+	if a.store == nil {
+		return fmt.Errorf("settings store not configured")
+	}
+
+	config.ApplyHardcoded(newCfg)
+
+	data, err := json.Marshal(newCfg)
+	if err != nil {
+		return err
+	}
+
+	// Keep the original shared config pointer updated in place so long-lived
+	// components started with that pointer (handler/background loops/providers)
+	// observe runtime config changes such as proxy updates immediately.
+	storedCfg := newCfg
+	if current != nil {
+		*current = *newCfg
+		storedCfg = current
+	}
+	a.config.Store(storedCfg)
+	if err := a.store.SetSetting(ctx, "config", string(data)); err != nil {
+		return err
+	}
+	if tokenCacheConfigChanged(current, newCfg) {
+		a.clearTokenCaches(ctx)
+	}
+	return nil
 }

@@ -1,9 +1,436 @@
 // Models management JavaScript
 
 let models = [];
-let currentModelChannel = '';
+let currentModelChannel = "";
+let modelSearchTerm = "";
+let modelStatusFilter = "";
+let modelPageSize = 50;
+let modelCurrentPage = 1;
+let modelRefreshInFlight = false;
+let modelRefreshResults = {};
 
-// Load models from API
+function modelChannels() {
+  const defaultChannels = ["Orchids", "Warp", "Bolt", "Puter", "Grok"];
+  const seen = new Set();
+  const ordered = [];
+
+  defaultChannels.forEach((channel) => {
+    if (seen.has(channel.toLowerCase())) return;
+    seen.add(channel.toLowerCase());
+    ordered.push(channel);
+  });
+
+  models
+    .map((m) => String(m.channel || "").trim())
+    .filter(Boolean)
+    .sort((a, b) => a.localeCompare(b))
+    .forEach((channel) => {
+      const key = channel.toLowerCase();
+      if (seen.has(key)) return;
+      seen.add(key);
+      ordered.push(channel);
+    });
+
+  return ordered;
+}
+
+function normalizeModelStatus(status) {
+  if (status === true) return "available";
+  const value = String(status || "").trim().toLowerCase();
+  return value || "offline";
+}
+
+function statusMeta(status) {
+  switch (normalizeModelStatus(status)) {
+    case "available":
+      return { label: "可用", bg: "rgba(34, 197, 94, 0.12)", color: "#4ade80", border: "rgba(34, 197, 94, 0.22)" };
+    case "maintenance":
+      return { label: "维护中", bg: "rgba(245, 158, 11, 0.12)", color: "#fbbf24", border: "rgba(245, 158, 11, 0.24)" };
+    default:
+      return { label: "已下线", bg: "rgba(148, 163, 184, 0.12)", color: "#cbd5e1", border: "rgba(148, 163, 184, 0.24)" };
+  }
+}
+
+function sortModels(list) {
+  return list.sort((a, b) => {
+    const sortDiff = Number(a.sort_order || 0) - Number(b.sort_order || 0);
+    if (sortDiff !== 0) return sortDiff;
+    return String(a.model_id || "").localeCompare(String(b.model_id || ""));
+  });
+}
+
+function getChannelScopedModels() {
+  let scoped = models.slice();
+
+  if (currentModelChannel) {
+    scoped = scoped.filter((m) => String(m.channel || "").toLowerCase() === currentModelChannel.toLowerCase());
+  }
+
+  return sortModels(scoped);
+}
+
+function getFilteredModels() {
+  let filtered = getChannelScopedModels().slice();
+
+  if (modelStatusFilter) {
+    filtered = filtered.filter((m) => normalizeModelStatus(m.status) === modelStatusFilter);
+  }
+
+  if (modelSearchTerm) {
+    const term = modelSearchTerm.toLowerCase();
+    filtered = filtered.filter((m) => {
+      return [
+        m.model_id,
+        m.name,
+        m.channel,
+        m.id,
+      ].some((value) => String(value || "").toLowerCase().includes(term));
+    });
+  }
+
+  return filtered;
+}
+
+function updateModelSummary(channelModels, filtered) {
+  const channelLabel = currentModelChannel || "全部";
+
+  const totalModelCount = document.getElementById("totalModelCount");
+  if (totalModelCount) {
+    totalModelCount.textContent = String(filtered.length);
+  }
+
+  const currentChannelPill = document.getElementById("currentChannelPill");
+  if (currentChannelPill) {
+    currentChannelPill.textContent = channelLabel;
+  }
+
+  const filterMeta = document.getElementById("modelsFilterMeta");
+  if (filterMeta) {
+    filterMeta.textContent = `当前渠道共 ${channelModels.length} 条，筛选后 ${filtered.length} 条。`;
+  }
+
+  const panelTitle = document.getElementById("modelsPanelTitle");
+  if (panelTitle) {
+    panelTitle.textContent = `${channelLabel} 动作区`;
+  }
+
+  const panelHint = document.getElementById("modelsPanelHint");
+  if (panelHint) {
+    panelHint.textContent = filtered.length > 0
+      ? `当前筛选结果共有 ${filtered.length} 条，可直接在表格中编辑、删除或启停。默认模型请在编辑弹窗里维护。`
+      : "当前筛选条件下没有命中的模型记录。";
+  }
+}
+
+function refreshChannelKey(channel) {
+  return String(channel || "").trim().toLowerCase();
+}
+
+function sortTextValues(values) {
+  return values
+    .map((value) => String(value || "").trim())
+    .filter(Boolean)
+    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }));
+}
+
+function normalizeModelRefreshResult(data, fallbackChannel) {
+  return {
+    channel: String(data.channel || fallbackChannel || "").trim(),
+    discovered: Number(data.discovered ?? 0),
+    verified: Number(data.verified ?? 0),
+    added: Number(data.added ?? 0),
+    updated: Number(data.updated ?? 0),
+    deleted: Number(data.deleted ?? 0),
+    deletedModelIDs: sortTextValues(Array.isArray(data.deleted_model_ids) ? data.deleted_model_ids : []),
+  };
+}
+
+function renderModelRefreshSummary() {
+  const summary = document.getElementById("modelsRefreshSummary");
+  const title = document.getElementById("modelsRefreshSummaryTitle");
+  const meta = document.getElementById("modelsRefreshSummaryMeta");
+  const statGrid = document.getElementById("modelsRefreshStatGrid");
+  const deletedBlock = document.getElementById("modelsRefreshDeletedBlock");
+  const deletedList = document.getElementById("modelsRefreshDeletedList");
+  if (!summary || !title || !meta || !statGrid || !deletedBlock || !deletedList) return;
+
+  const channel = currentModelChannel || modelChannels()[0] || "";
+  const result = modelRefreshResults[refreshChannelKey(channel)];
+  if (!result) {
+    summary.hidden = true;
+    statGrid.innerHTML = "";
+    deletedList.innerHTML = "";
+    deletedBlock.hidden = true;
+    return;
+  }
+
+  summary.hidden = false;
+  title.textContent = `${result.channel || channel} 最近一次刷新结果`;
+  meta.textContent = `已按来源列表完成同步。发现到的模型会写入当前渠道，来源列表里消失的模型会直接删除。`;
+
+  const stats = [
+    { label: "发现", value: result.discovered },
+    { label: "同步", value: result.verified },
+    { label: "新增", value: result.added },
+    { label: "更新", value: result.updated },
+    { label: "删除", value: result.deleted },
+  ];
+  statGrid.innerHTML = stats.map((item) => `
+    <div class="models-refresh-stat">
+      <div class="models-refresh-stat-label">${escapeHtml(item.label)}</div>
+      <div class="models-refresh-stat-value">${escapeHtml(String(item.value))}</div>
+    </div>
+  `).join("");
+
+  const deletedItems = sortTextValues(result.deletedModelIDs || []);
+  deletedBlock.hidden = deletedItems.length === 0;
+  deletedList.innerHTML = deletedItems.map((item) => `
+    <span class="models-refresh-deleted-item">${escapeHtml(item)}</span>
+  `).join("");
+}
+
+function renderChannelTabs() {
+  const container = document.getElementById("modelPlatformFilters");
+  if (!container) return;
+
+  const channels = modelChannels();
+  if (!currentModelChannel || !channels.includes(currentModelChannel)) {
+    currentModelChannel = channels[0] || "";
+  }
+
+  container.innerHTML = "";
+  channels.forEach((channel) => {
+    const btn = document.createElement("button");
+    btn.className = `tab-item ${currentModelChannel === channel ? "active" : ""}`.trim();
+    btn.type = "button";
+    btn.textContent = channel;
+    btn.dataset.channel = encodeData(channel);
+    btn.addEventListener("click", () => {
+      filterModelsByChannel(channel);
+    });
+    container.appendChild(btn);
+  });
+
+  updateRefreshButton();
+}
+
+function renderPagination(current, total) {
+  const container = document.getElementById("modelsPaginationControls");
+  if (!container) return;
+
+  container.innerHTML = "";
+
+  const appendButton = (label, page, disabled, active) => {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = `btn ${active ? "btn-primary" : "btn-outline"}`;
+    btn.disabled = disabled;
+    btn.dataset.page = String(page);
+    btn.textContent = label;
+    btn.style.padding = "6px 12px";
+    container.appendChild(btn);
+  };
+
+  appendButton("首页", 1, current === 1, false);
+  appendButton("上一页", current - 1, current === 1, false);
+
+  let startPage = Math.max(1, current - 2);
+  let endPage = Math.min(total, startPage + 4);
+  if (endPage-startPage < 4) {
+    startPage = Math.max(1, endPage - 4);
+  }
+
+  for (let page = startPage; page <= endPage; page += 1) {
+    appendButton(String(page), page, false, page === current);
+  }
+
+  appendButton("下一页", current + 1, current === total, false);
+  appendButton("末页", total, current === total, false);
+
+  container.onclick = (event) => {
+    const btn = event.target.closest("button[data-page]");
+    if (!btn || btn.disabled) return;
+    const page = parseInt(btn.dataset.page || "", 10);
+    if (Number.isNaN(page)) return;
+    modelCurrentPage = page;
+    renderModels();
+  };
+}
+
+function renderModels() {
+  const container = document.getElementById("modelsList");
+  const channelModels = getChannelScopedModels();
+  const filtered = getFilteredModels();
+  updateModelSummary(channelModels, filtered);
+  renderModelRefreshSummary();
+
+  const total = filtered.length;
+  const totalPages = Math.max(1, Math.ceil(total / modelPageSize));
+  if (modelCurrentPage > totalPages) modelCurrentPage = totalPages;
+  if (modelCurrentPage < 1) modelCurrentPage = 1;
+
+  const start = (modelCurrentPage - 1) * modelPageSize;
+  const pageItems = filtered.slice(start, start + modelPageSize);
+  const pageCount = document.getElementById("currentPageCount");
+  if (pageCount) {
+    pageCount.textContent = String(pageItems.length);
+  }
+
+  const paginationInfo = document.getElementById("modelsPaginationInfo");
+  if (paginationInfo) {
+    paginationInfo.textContent = `共 ${total} 条记录，第 ${modelCurrentPage}/${totalPages} 页`;
+  }
+  renderPagination(modelCurrentPage, totalPages);
+
+  if (pageItems.length === 0) {
+    container.innerHTML = `
+      <div class="models-empty empty-state-panel">
+        <span class="models-empty-icon empty-state-mark">◈</span>
+        <p>当前筛选条件下暂无模型数据</p>
+      </div>
+    `;
+    return;
+  }
+
+  if (window.matchMedia("(max-width: 640px)").matches) {
+    renderModelsMobile(container, pageItems);
+    return;
+  }
+
+  const rows = pageItems.map((m) => {
+    const status = statusMeta(m.status);
+    const defaultBadge = m.is_default ? `<span class="models-default-badge">默认</span>` : "";
+
+    return `
+      <tr>
+        <td class="col-model">
+          <div class="models-cell-main">
+            <div class="models-cell-title">
+              <strong>${escapeHtml(m.name || m.model_id || "-")}</strong>
+              ${defaultBadge}
+            </div>
+            <span class="models-model-id">${escapeHtml(m.model_id || "-")}</span>
+            <span class="models-cell-sub">排序 ${escapeHtml(String(m.sort_order ?? 0))}</span>
+          </div>
+        </td>
+        <td class="col-status">
+          <span class="models-status-badge" style="background:${status.bg};color:${status.color};border-color:${status.border};">${status.label}</span>
+        </td>
+        <td class="col-sort">${escapeHtml(String(m.sort_order ?? 0))}</td>
+        <td class="col-toggle">
+          <label class="toggle" title="${normalizeModelStatus(m.status) === "available" ? "点击下线" : "点击启用"}">
+            <input type="checkbox" data-action="toggle-status" data-id="${encodeData(m.id)}" ${normalizeModelStatus(m.status) === "available" ? "checked" : ""} />
+            <span class="toggle-slider"></span>
+          </label>
+        </td>
+        <td class="col-actions">
+          <div class="models-actions">
+            <button type="button" class="btn btn-outline models-action-btn" data-action="edit" data-id="${encodeData(m.id)}">编辑</button>
+            <button type="button" class="btn btn-outline models-action-btn models-action-btn-danger" data-action="delete" data-id="${encodeData(m.id)}">删除</button>
+          </div>
+        </td>
+      </tr>
+    `;
+  }).join("");
+
+  container.innerHTML = `
+    <div class="table-wrap models-table-wrap">
+      <table class="models-table">
+        <thead>
+          <tr>
+            <th class="col-model">模型</th>
+            <th class="col-status">状态</th>
+            <th class="col-sort">排序</th>
+            <th class="col-toggle">启用</th>
+            <th class="col-actions">操作</th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+  `;
+
+  container.onclick = (event) => {
+    const target = event.target.closest("[data-action]");
+    if (!target || !container.contains(target)) return;
+    const action = target.dataset.action;
+    const id = decodeData(target.dataset.id || "");
+    if (!id) return;
+    if (action === "edit") editModel(id);
+    if (action === "delete") deleteModel(id);
+  };
+
+  container.onchange = (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLInputElement)) return;
+    if (target.dataset.action !== "toggle-status") return;
+    const id = decodeData(target.dataset.id || "");
+    if (!id) return;
+    toggleModelStatus(id, target.checked);
+  };
+}
+
+function renderModelsMobile(container, pageItems) {
+  const cards = pageItems.map((m) => {
+    const status = statusMeta(m.status);
+    const defaultBadge = m.is_default ? `<span class="models-default-badge">默认</span>` : "";
+    return `
+      <article class="models-mobile-card">
+        <div class="models-mobile-head">
+          <div class="models-cell-title">
+            <strong>${escapeHtml(m.name || m.model_id || "-")}</strong>
+            ${defaultBadge}
+          </div>
+          <span class="models-status-badge" style="background:${status.bg};color:${status.color};border-color:${status.border};">${status.label}</span>
+        </div>
+        <div class="models-model-id">${escapeHtml(m.model_id || "-")}</div>
+        <div class="models-mobile-grid">
+          <div class="models-mobile-item">
+            <span class="models-mobile-label">渠道</span>
+            <span>${escapeHtml(m.channel || "-")}</span>
+          </div>
+          <div class="models-mobile-item">
+            <span class="models-mobile-label">排序</span>
+            <span>${escapeHtml(String(m.sort_order ?? 0))}</span>
+          </div>
+          <div class="models-mobile-item">
+            <span class="models-mobile-label">启用</span>
+            <label class="toggle" title="${normalizeModelStatus(m.status) === "available" ? "点击下线" : "点击启用"}">
+              <input type="checkbox" data-action="toggle-status" data-id="${encodeData(m.id)}" ${normalizeModelStatus(m.status) === "available" ? "checked" : ""} />
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+        </div>
+        <div class="models-mobile-actions">
+          <button type="button" class="btn btn-outline models-action-btn" data-action="edit" data-id="${encodeData(m.id)}">编辑</button>
+          <button type="button" class="btn btn-outline models-action-btn models-action-btn-danger" data-action="delete" data-id="${encodeData(m.id)}">删除</button>
+        </div>
+      </article>
+    `;
+  }).join("");
+
+  container.innerHTML = `<div class="models-mobile-list">${cards}</div>`;
+
+  container.onclick = (event) => {
+    const target = event.target.closest("[data-action]");
+    if (!target || !container.contains(target)) return;
+    const action = target.dataset.action;
+    const id = decodeData(target.dataset.id || "");
+    if (!id) return;
+    if (action === "edit") editModel(id);
+    if (action === "delete") deleteModel(id);
+  };
+
+  container.onchange = (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLInputElement)) return;
+    if (target.dataset.action !== "toggle-status") return;
+    const id = decodeData(target.dataset.id || "");
+    if (!id) return;
+    toggleModelStatus(id, target.checked);
+  };
+}
+
 async function loadModels() {
   try {
     const res = await fetch("/api/models");
@@ -13,327 +440,55 @@ async function loadModels() {
     }
     models = await res.json() || [];
     renderChannelTabs();
+    updateModelChannelOptions();
     renderModels();
+    updateRefreshButton();
   } catch (err) {
     showToast("加载模型失败", "error");
   }
 }
 
-// Render channel filter tabs
-function renderChannelTabs() {
-  const container = document.getElementById("modelPlatformFilters");
-  if (!container) return;
-
-  const defaultChannels = ["Orchids", "Warp"];
-  const channels = new Set([...defaultChannels, ...models.map(m => m.channel)]);
-  const sorted = Array.from(channels).sort();
-  const tabs = [...sorted];
-
-  if (currentModelChannel === '' || !tabs.includes(currentModelChannel)) {
-    currentModelChannel = tabs.length > 0 ? tabs[0] : '';
-  }
-
-  container.innerHTML = "";
-  tabs.forEach(channel => {
-    const label = String(channel || "");
-    const isActive = currentModelChannel === label;
-    const btn = document.createElement("button");
-    btn.className = `tab-item ${isActive ? 'active' : ''}`.trim();
-    btn.dataset.channel = encodeURIComponent(label);
-    btn.textContent = label;
-    btn.addEventListener("click", () => {
-      const raw = btn.dataset.channel ? decodeURIComponent(btn.dataset.channel) : "";
-      filterModelsByChannel(raw);
-    });
-    container.appendChild(btn);
-  });
-}
-
-// Render models table
-function renderModels() {
-  const container = document.getElementById("modelsList");
-  let filtered = models;
-  if (currentModelChannel) {
-    filtered = models.filter(m => m.channel.toLowerCase() === currentModelChannel.toLowerCase());
-  }
-
-  // Sort: SortOrder ascending
-  filtered.sort((a, b) => {
-    return a.sort_order - b.sort_order;
-  });
-
-  document.getElementById("totalModelCount").textContent = filtered.length;
-
-  if (filtered.length === 0) {
-    container.innerHTML = "";
-    const empty = document.createElement("div");
-    empty.className = "empty-state";
-    empty.style.display = "flex";
-    empty.style.flexDirection = "column";
-    empty.style.alignItems = "center";
-    empty.style.justifyContent = "center";
-    empty.style.height = "300px";
-    empty.style.color = "#94a3b8";
-    const icon = document.createElement("span");
-    icon.style.fontSize = "3rem";
-    icon.style.marginBottom = "16px";
-    icon.textContent = "💎";
-    const text = document.createElement("p");
-    text.textContent = `暂无${currentModelChannel ? " " + currentModelChannel : ""} 模型数据`;
-    empty.appendChild(icon);
-    empty.appendChild(text);
-    container.appendChild(empty);
-    return;
-  }
-
-  container.innerHTML = "";
-  const wrapper = document.createElement("div");
-  wrapper.style.maxWidth = "100%";
-
-  filtered.forEach((m) => {
-    const card = document.createElement("div");
-    card.style.padding = "24px";
-    card.style.borderRadius = "12px";
-    card.style.border = `1px solid ${m.is_default ? "#3b82f6" : "#e2e8f0"}`;
-    card.style.background = "#fff";
-    card.style.boxShadow = "0 1px 3px rgba(0,0,0,0.1)";
-    card.style.marginBottom = "16px";
-
-    const row = document.createElement("div");
-    row.style.display = "flex";
-    row.style.alignItems = "flex-start";
-    row.style.justifyContent = "space-between";
-    row.style.marginBottom = "12px";
-
-    const left = document.createElement("div");
-    left.style.flex = "1";
-
-    const titleRow = document.createElement("div");
-    titleRow.style.display = "flex";
-    titleRow.style.alignItems = "center";
-    titleRow.style.gap = "12px";
-    titleRow.style.marginBottom = "8px";
-
-    const h3 = document.createElement("h3");
-    h3.style.fontWeight = "600";
-    h3.style.fontSize = "1.1rem";
-    h3.style.color = "#1e293b";
-    h3.style.margin = "0";
-    h3.textContent = m.name || "";
-
-    const badge = document.createElement("span");
-    badge.className = `tag badge-${sanitizeClassName(m.channel)}`;
-    badge.style.fontSize = "0.75rem";
-    badge.textContent = m.channel || "";
-
-    titleRow.appendChild(h3);
-    titleRow.appendChild(badge);
-
-    if (m.is_default) {
-      const def = document.createElement("span");
-      def.style.background = "#dbeafe";
-      def.style.color = "#1d4ed8";
-      def.style.padding = "2px 8px";
-      def.style.borderRadius = "4px";
-      def.style.fontSize = "0.75rem";
-      def.style.fontWeight = "500";
-      def.textContent = "默认";
-      titleRow.appendChild(def);
-    }
-
-    const modelId = document.createElement("div");
-    modelId.style.fontFamily = "monospace";
-    modelId.style.color = "#64748b";
-    modelId.style.fontSize = "0.9rem";
-    modelId.style.marginBottom = "8px";
-    modelId.textContent = m.model_id || "";
-
-    const desc = document.createElement("div");
-    desc.style.color = "#64748b";
-    desc.style.fontSize = "0.85rem";
-    desc.style.lineHeight = "1.5";
-    desc.textContent = `该模型用于 ${m.channel || ""} 渠道的 API 调用${m.is_default ? "，作为默认模型优先使用" : ""}`;
-
-    left.appendChild(titleRow);
-    left.appendChild(modelId);
-    left.appendChild(desc);
-
-    const right = document.createElement("div");
-    right.style.display = "flex";
-    right.style.alignItems = "center";
-    right.style.gap = "12px";
-
-    const label = document.createElement("label");
-    label.className = "toggle";
-    label.style.transform = "scale(0.9)";
-    const checkbox = document.createElement("input");
-    checkbox.type = "checkbox";
-    checkbox.checked = m.status === "available" || m.status === true;
-    checkbox.dataset.action = "toggle-status";
-    checkbox.dataset.id = encodeData(m.id);
-    const slider = document.createElement("span");
-    slider.className = "toggle-slider";
-    label.appendChild(checkbox);
-    label.appendChild(slider);
-
-    const actionWrap = document.createElement("div");
-    actionWrap.style.display = "flex";
-    actionWrap.style.gap = "8px";
-
-    const edit = document.createElement("i");
-    edit.className = "action-icon";
-    edit.style.fontSize = "1.2rem";
-    edit.style.cursor = "pointer";
-    edit.dataset.action = "edit";
-    edit.dataset.id = encodeData(m.id);
-    edit.title = "编辑";
-    edit.textContent = "✏️";
-
-    const del = document.createElement("i");
-    del.className = "action-icon";
-    del.style.fontSize = "1.2rem";
-    del.style.cursor = "pointer";
-    del.style.color = "#ef4444";
-    del.dataset.action = "delete";
-    del.dataset.id = encodeData(m.id);
-    del.title = "删除";
-    del.textContent = "🗑️";
-
-    actionWrap.appendChild(edit);
-    actionWrap.appendChild(del);
-
-    right.appendChild(label);
-    right.appendChild(actionWrap);
-
-    row.appendChild(left);
-    row.appendChild(right);
-    card.appendChild(row);
-
-    if (!m.is_default) {
-      const btn = document.createElement("button");
-      btn.className = "btn btn-outline";
-      btn.style.padding = "6px 16px";
-      btn.style.fontSize = "0.85rem";
-      btn.dataset.action = "set-default";
-      btn.dataset.id = encodeData(m.id);
-      btn.textContent = "设为默认模型";
-      card.appendChild(btn);
-    }
-
-    wrapper.appendChild(card);
-  });
-
-  const tip = document.createElement("div");
-  tip.style.marginTop = "24px";
-  tip.style.padding = "16px";
-  tip.style.background = "#eff6ff";
-  tip.style.border = "1px solid #bfdbfe";
-  tip.style.borderRadius = "8px";
-  tip.style.color = "#1e40af";
-  const tipRow = document.createElement("div");
-  tipRow.style.display = "flex";
-  tipRow.style.gap = "8px";
-  tipRow.style.alignItems = "start";
-  const tipIcon = document.createElement("span");
-  tipIcon.style.fontSize = "1.2rem";
-  tipIcon.textContent = "💡";
-  const tipBody = document.createElement("div");
-  tipBody.style.flex = "1";
-  const tipTitle = document.createElement("div");
-  tipTitle.style.fontWeight = "600";
-  tipTitle.style.marginBottom = "4px";
-  tipTitle.textContent = "提示";
-  const tipText = document.createElement("div");
-  tipText.style.fontSize = "0.9rem";
-  tipText.style.lineHeight = "1.6";
-  const tipLines = [
-    "• 默认模型将优先用于 API 调用",
-    "• 禁用的模型不会出现在可用模型列表中",
-    "• 排序值越小，在列表中越靠前",
-  ];
-  tipLines.forEach((line, idx) => {
-    if (idx > 0) tipText.appendChild(document.createElement("br"));
-    tipText.appendChild(document.createTextNode(line));
-  });
-  tipBody.appendChild(tipTitle);
-  tipBody.appendChild(tipText);
-  tipRow.appendChild(tipIcon);
-  tipRow.appendChild(tipBody);
-  tip.appendChild(tipRow);
-  wrapper.appendChild(tip);
-  container.appendChild(wrapper);
-
-  container.onclick = (e) => {
-    const target = e.target.closest("[data-action]");
-    if (!target || !container.contains(target)) return;
-    const action = target.dataset.action;
-    const id = decodeData(target.dataset.id || "");
-    if (!id) return;
-    if (action === "edit") editModel(id);
-    if (action === "delete") deleteModel(id);
-    if (action === "set-default") setDefaultModel(id);
-  };
-
-  container.onchange = (e) => {
-    const target = e.target;
-    if (!(target instanceof HTMLInputElement)) return;
-    if (target.dataset.action !== "toggle-status") return;
-    const id = decodeData(target.dataset.id || "");
-    if (!id) return;
-    toggleModelStatus(id, target.checked);
-  };
-}
-
-// Set model as default
-async function setDefaultModel(id) {
-  const model = models.find(m => m.id === id);
-  if (!model) return;
-
-  try {
-    const updatedModel = { ...model, is_default: true };
-    const res = await fetch(`/api/models/${id}`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(updatedModel),
-    });
-    if (!res.ok) throw new Error(await res.text());
-
-    showToast("设为默认成功");
-    loadModels();
-  } catch (err) {
-    showToast("设置失败: " + err.message, "error");
-  }
-}
-
-// Filter models by channel
 function filterModelsByChannel(channel) {
   currentModelChannel = channel;
-  document.querySelectorAll("#modelPlatformFilters .tab-item").forEach(btn => {
+  modelCurrentPage = 1;
+  document.querySelectorAll("#modelPlatformFilters .tab-item").forEach((btn) => {
     btn.classList.toggle("active", btn.textContent === channel);
   });
-
-  const header = document.querySelector("#modelsHeader h1");
-  const sub = document.querySelector("#modelsHeader p");
-
-  document.getElementById("modelsListWrapper").style.display = 'block';
-  document.getElementById("totalModelCount").parentElement.style.visibility = 'visible';
-  if (header) header.textContent = "模型管理";
-  if (sub) sub.textContent = "管理各渠道的可用模型列表";
   renderModels();
+  updateRefreshButton();
 }
 
-// Open model modal
+function updateModelChannelOptions() {
+  const select = document.getElementById("modelChannel");
+  if (!select) return;
+
+  const previous = select.value;
+  select.innerHTML = "";
+  modelChannels().forEach((channel) => {
+    const option = document.createElement("option");
+    option.value = channel;
+    option.textContent = channel;
+    select.appendChild(option);
+  });
+
+  if (previous && Array.from(select.options).some((option) => option.value === previous)) {
+    select.value = previous;
+  } else if (currentModelChannel && Array.from(select.options).some((option) => option.value === currentModelChannel)) {
+    select.value = currentModelChannel;
+  }
+}
+
 function openModelModal(model = null) {
   const modal = document.getElementById("modelModal");
   const title = document.getElementById("modelModalTitle");
   const form = document.getElementById("modelForm");
 
+  updateModelChannelOptions();
+
   const setSelectValue = (el, value) => {
     if (!el) return;
     const raw = value === null || value === undefined ? "" : String(value);
     el.value = raw;
-    // 如果 value 不在 option 列表里，浏览器会显示空白。
-    // 这里兜底为第一个 option，避免“白框像没值”。
     if (el.tagName === "SELECT" && el.value !== raw) {
       el.selectedIndex = 0;
     }
@@ -346,38 +501,38 @@ function openModelModal(model = null) {
     document.getElementById("modelModelId").value = model.model_id;
     document.getElementById("modelName").value = model.name;
     document.getElementById("modelSortOrder").value = model.sort_order;
-    setSelectValue(document.getElementById("modelStatus"), model.status);
-    document.getElementById("modelIsDefault").checked = model.is_default;
+    setSelectValue(document.getElementById("modelStatus"), normalizeModelStatus(model.status));
+    document.getElementById("modelIsDefault").checked = !!model.is_default;
   } else {
     title.textContent = "添加模型";
     form.reset();
     document.getElementById("modelId").value = "";
-    setSelectValue(document.getElementById("modelChannel"), "Orchids");
+    setSelectValue(document.getElementById("modelChannel"), currentModelChannel || "Orchids");
     document.getElementById("modelSortOrder").value = "0";
     setSelectValue(document.getElementById("modelStatus"), "available");
   }
+
   modal.classList.add("active");
   modal.style.display = "flex";
 }
 
-// Close model modal
 function closeModelModal() {
   const modal = document.getElementById("modelModal");
   modal.classList.remove("active");
   modal.style.display = "none";
 }
 
-// Save model
-async function saveModel(e) {
-  e.preventDefault();
+async function saveModel(event) {
+  event.preventDefault();
+
   const id = document.getElementById("modelId").value;
   const data = {
     channel: document.getElementById("modelChannel").value,
     model_id: document.getElementById("modelModelId").value,
     name: document.getElementById("modelName").value,
-    sort_order: parseInt(document.getElementById("modelSortOrder").value) || 0,
+    sort_order: parseInt(document.getElementById("modelSortOrder").value, 10) || 0,
     status: document.getElementById("modelStatus").value,
-    is_default: document.getElementById("modelIsDefault").checked
+    is_default: document.getElementById("modelIsDefault").checked,
   };
 
   if (id) {
@@ -394,26 +549,24 @@ async function saveModel(e) {
     });
     if (!res.ok) throw new Error(await res.text());
     closeModelModal();
-    loadModels();
+    await loadModels();
     showToast("保存成功");
   } catch (err) {
-    showToast("保存失败: " + err.message, "error");
+    showToast(`保存失败: ${err.message}`, "error");
   }
 }
 
-// Edit model
 function editModel(id) {
-  const model = models.find(m => m.id === id);
+  const model = models.find((item) => item.id === id);
   if (model) openModelModal(model);
 }
 
-// Toggle model status
 async function toggleModelStatus(id, enabled) {
-  const model = models.find(m => m.id === id);
+  const model = models.find((item) => item.id === id);
   if (!model) return;
 
   try {
-    const updatedModel = { ...model, status: enabled ? 'available' : 'offline' };
+    const updatedModel = { ...model, status: enabled ? "available" : "offline" };
     const res = await fetch(`/api/models/${id}`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
@@ -421,28 +574,93 @@ async function toggleModelStatus(id, enabled) {
     });
     if (!res.ok) throw new Error(await res.text());
     showToast(enabled ? "模型已启用" : "模型已禁用");
-    loadModels();
+    await loadModels();
   } catch (err) {
-    showToast("操作失败: " + err.message, "error");
+    showToast(`操作失败: ${err.message}`, "error");
   }
 }
 
-// Delete model
 async function deleteModel(id) {
   if (!confirm("确定要删除这个模型吗？")) return;
   try {
     const res = await fetch(`/api/models/${id}`, { method: "DELETE" });
     if (!res.ok) throw new Error(await res.text());
     showToast("删除成功");
-    loadModels();
+    await loadModels();
   } catch (err) {
-    showToast("删除失败: " + err.message, "error");
+    showToast(`删除失败: ${err.message}`, "error");
   }
 }
 
-// Escape HTML to prevent XSS
+function updateRefreshButton() {
+  const button = document.getElementById("refreshModelsButton");
+  if (!button) return;
+
+  const channel = currentModelChannel || modelChannels()[0] || "";
+  button.disabled = modelRefreshInFlight || !channel;
+  if (!channel) {
+    button.textContent = "刷新当前渠道";
+    return;
+  }
+  button.textContent = modelRefreshInFlight
+    ? `正在刷新 ${channel}...`
+    : `刷新 ${channel} 列表`;
+}
+
+async function refreshModelsForCurrentChannel() {
+  const channel = currentModelChannel || modelChannels()[0] || "";
+  if (!channel || modelRefreshInFlight) return;
+
+  modelRefreshInFlight = true;
+  updateRefreshButton();
+
+  try {
+    const res = await fetch("/api/models/refresh", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ channel }),
+    });
+
+    const raw = await res.text();
+    let data = {};
+    if (raw) {
+      try {
+        data = JSON.parse(raw);
+      } catch (err) {
+        data = { message: raw };
+      }
+    }
+
+    if (!res.ok) {
+      throw new Error(data.message || raw || "刷新失败");
+    }
+
+    const normalized = normalizeModelRefreshResult(data, channel);
+    if (normalized.channel) {
+      modelRefreshResults[refreshChannelKey(normalized.channel)] = normalized;
+    }
+
+    await loadModels();
+
+    const parts = [
+      `发现 ${data.discovered ?? 0}`,
+      `同步 ${data.verified ?? 0}`,
+      `新增 ${data.added ?? 0}`,
+      `更新 ${data.updated ?? 0}`,
+      `删除 ${data.deleted ?? 0}`,
+    ];
+    const hasDeleted = normalized.deletedModelIDs.length > 0;
+    showToast(`${channel} 刷新完成：${parts.join("，")}${hasDeleted ? "。已在下方列出删除模型" : ""}`);
+  } catch (err) {
+    showToast(`刷新失败: ${err.message}`, "error");
+  } finally {
+    modelRefreshInFlight = false;
+    updateRefreshButton();
+  }
+}
+
 function escapeHtml(text) {
-  const div = document.createElement('div');
+  const div = document.createElement("div");
   div.textContent = text === null || text === undefined ? "" : String(text);
   return div.innerHTML;
 }
@@ -460,12 +678,34 @@ function decodeData(value) {
   }
 }
 
-function sanitizeClassName(text) {
-  if (text === null || text === undefined) return "";
-  return String(text).toLowerCase().replace(/[^a-z0-9_-]+/g, "-");
-}
+document.addEventListener("DOMContentLoaded", () => {
+  const searchInput = document.getElementById("modelSearchInput");
+  const statusFilter = document.getElementById("modelStatusFilter");
+  const pageSize = document.getElementById("modelPageSize");
 
-// Load models on page load
-document.addEventListener('DOMContentLoaded', () => {
+  if (searchInput) {
+    searchInput.addEventListener("input", (event) => {
+      modelSearchTerm = String(event.target.value || "").trim();
+      modelCurrentPage = 1;
+      renderModels();
+    });
+  }
+
+  if (statusFilter) {
+    statusFilter.addEventListener("change", (event) => {
+      modelStatusFilter = String(event.target.value || "").trim();
+      modelCurrentPage = 1;
+      renderModels();
+    });
+  }
+
+  if (pageSize) {
+    pageSize.addEventListener("change", (event) => {
+      modelPageSize = parseInt(event.target.value || "50", 10) || 50;
+      modelCurrentPage = 1;
+      renderModels();
+    });
+  }
+
   loadModels();
 });

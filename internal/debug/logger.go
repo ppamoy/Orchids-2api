@@ -3,8 +3,8 @@ package debug
 import (
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
+	"github.com/goccy/go-json"
 	"os"
 	"path/filepath"
 	"sync"
@@ -166,6 +166,23 @@ func (l *Logger) LogOutputSSE(event string, data string) {
 
 	elapsed := time.Since(l.startTime).Milliseconds()
 	fmt.Fprintf(l.outFile, "[%dms] event: %s\ndata: %s\n\n", elapsed, event, data)
+}
+
+// LogInputTokenBreakdown 记录输入 token 分解
+func (l *Logger) LogInputTokenBreakdown(profile string, basePromptTokens, systemContextTokens, historyTokens, toolsTokens, total int) {
+	if !l.enabled {
+		return
+	}
+
+	payload := map[string]interface{}{
+		"prompt_profile":        profile,
+		"base_prompt_tokens":    basePromptTokens,
+		"system_context_tokens": systemContextTokens,
+		"history_tokens":        historyTokens,
+		"tools_tokens":          toolsTokens,
+		"estimated_total":       total,
+	}
+	l.writeJSON("6_input_token_breakdown.json", payload)
 }
 
 // LogSummary 记录请求摘要

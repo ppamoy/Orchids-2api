@@ -2,7 +2,7 @@ package clerk
 
 import (
 	"encoding/base64"
-	"encoding/json"
+	"github.com/goccy/go-json"
 	"testing"
 )
 
@@ -98,6 +98,70 @@ func TestParseClientCookies_InvalidPlainInputRejected(t *testing.T) {
 
 	if _, _, err := ParseClientCookies("short-token"); err == nil {
 		t.Fatalf("expected error for invalid plain token input")
+	}
+}
+
+func TestParseOrchidsCookies_JSONExport_SessionOnly(t *testing.T) {
+	t.Parallel()
+
+	sessionJWT := fakeJWT(map[string]interface{}{
+		"sid": "sess_json",
+		"sub": "user_json",
+	})
+	input := `[
+		{"name":"__session_zF1LqDSA","value":"` + sessionJWT + `"},
+		{"name":"__client_uat_zF1LqDSA","value":"1773712060"}
+	]`
+
+	parsed, ok, err := ParseOrchidsCookies(input)
+	if err != nil {
+		t.Fatalf("ParseOrchidsCookies returned error: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected Orchids cookies to be detected")
+	}
+	if parsed.ClientCookie != "" {
+		t.Fatalf("client cookie = %q, want empty", parsed.ClientCookie)
+	}
+	if parsed.SessionCookie != sessionJWT {
+		t.Fatalf("session cookie = %q, want %q", parsed.SessionCookie, sessionJWT)
+	}
+	if parsed.ClientUat != "1773712060" {
+		t.Fatalf("client uat = %q, want %q", parsed.ClientUat, "1773712060")
+	}
+}
+
+func TestParseOrchidsCookies_CookieHeader_PrefersExactNames(t *testing.T) {
+	t.Parallel()
+
+	sessionJWT := fakeJWT(map[string]interface{}{
+		"sid": "sess_exact",
+		"sub": "user_exact",
+	})
+	in := "__session_zF1LqDSA=old; __session=" + sessionJWT + "; __client_uat=1773712060"
+
+	parsed, ok, err := ParseOrchidsCookies(in)
+	if err != nil {
+		t.Fatalf("ParseOrchidsCookies returned error: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected Orchids cookies to be detected")
+	}
+	if parsed.SessionCookie != sessionJWT {
+		t.Fatalf("session cookie = %q, want %q", parsed.SessionCookie, sessionJWT)
+	}
+	if parsed.ClientUat != "1773712060" {
+		t.Fatalf("client uat = %q, want %q", parsed.ClientUat, "1773712060")
+	}
+}
+
+func TestBuildClerkCookieHeader_IncludesClientUatAndActiveContext(t *testing.T) {
+	t.Parallel()
+
+	got := buildClerkCookieHeader("client_cookie", "session_cookie", "1773712060", "sess_ctx")
+	want := "__client=client_cookie; __session=session_cookie; __client_uat=1773712060; clerk_active_context=sess_ctx:"
+	if got != want {
+		t.Fatalf("buildClerkCookieHeader()=%q want %q", got, want)
 	}
 }
 

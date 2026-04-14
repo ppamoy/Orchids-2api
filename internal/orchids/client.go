@@ -1,31 +1,93 @@
 package orchids
 
 import (
-	"bytes"
 	"context"
-	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
-	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/goccy/go-json"
+
 	"orchids-api/internal/clerk"
 	"orchids-api/internal/config"
 	"orchids-api/internal/debug"
-	"orchids-api/internal/perf"
-	"orchids-api/internal/prompt"
+	apperrors "orchids-api/internal/errors"
+	"orchids-api/internal/logutil"
 	"orchids-api/internal/store"
 	"orchids-api/internal/upstream"
+	"orchids-api/internal/util"
 )
 
-const defaultUpstreamBaseURL = "https://orchids-server.calmstone-6964e08a.westeurope.azurecontainerapps.io"
+type orchidsFastEnvelope struct {
+	Type string `json:"type"`
+}
+
+type orchidsFastTextMessage struct {
+	Type  string `json:"type"`
+	Delta string `json:"delta"`
+	Text  string `json:"text"`
+	Data  struct {
+		Text string `json:"text"`
+	} `json:"data"`
+	Chunk json.RawMessage `json:"chunk"`
+}
+
+type orchidsFastChunk struct {
+	Text    string `json:"text"`
+	Content string `json:"content"`
+}
+
+type orchidsFastUsage struct {
+	InputTokens       interface{} `json:"inputTokens"`
+	OutputTokens      interface{} `json:"outputTokens"`
+	InputTokensSnake  interface{} `json:"input_tokens"`
+	OutputTokensSnake interface{} `json:"output_tokens"`
+}
+
+type orchidsFastTokensMessage struct {
+	Type string           `json:"type"`
+	Data orchidsFastUsage `json:"data"`
+}
+
+type orchidsFastToolOutput struct {
+	Type      string      `json:"type"`
+	CallID    string      `json:"callId"`
+	ID        string      `json:"id"`
+	Name      string      `json:"name"`
+	Arguments string      `json:"arguments"`
+	Input     interface{} `json:"input"`
+}
+
+type orchidsFastResponseDone struct {
+	Type     string `json:"type"`
+	Response struct {
+		Usage  orchidsFastUsage        `json:"usage"`
+		Output []orchidsFastToolOutput `json:"output"`
+	} `json:"response"`
+}
+
+type orchidsFastModelMessage struct {
+	Type  string          `json:"type"`
+	Event json.RawMessage `json:"event"`
+}
+
+type orchidsFastErrorMessage struct {
+	Type    string `json:"type"`
+	Message string `json:"message"`
+	Code    string `json:"code"`
+	Data    struct {
+		Message string `json:"message"`
+		Code    string `json:"code"`
+	} `json:"data"`
+}
+
+const defaultUpstreamBaseURL = "https://orchids-v2-alpha-108292236521.europe-west1.run.app"
 const upstreamURL = defaultUpstreamBaseURL + "/agent/coding-agent"
 
 const (
@@ -37,31 +99,10 @@ type Client struct {
 	config     *config.Config
 	account    *store.Account
 	httpClient *http.Client
-	fsCache    *perf.TTLCache
-	wsPool     *upstream.WSPool
-	wsWriteMu  sync.Mutex // Protects concurrent writes to WebSocket
 }
 
 type TokenResponse struct {
 	JWT string `json:"jwt"`
-}
-
-type AgentRequest struct {
-	Prompt        string              `json:"prompt"`
-	ChatHistory   []interface{}       `json:"chatHistory"`
-	ProjectID     string              `json:"projectId"`
-	CurrentPage   interface{}         `json:"currentPage"`
-	AgentMode     string              `json:"agentMode"`
-	Mode          string              `json:"mode"`
-	GitRepoUrl    string              `json:"gitRepoUrl"`
-	Email         string              `json:"email"`
-	ChatSessionID string              `json:"chatSessionId"`
-	UserID        string              `json:"userId"`
-	APIVersion    int                 `json:"apiVersion"`
-	Model         string              `json:"model,omitempty"`
-	Messages      []prompt.Message    `json:"messages,omitempty"`
-	System        []prompt.SystemItem `json:"system,omitempty"`
-	Tools         []interface{}       `json:"tools,omitempty"`
 }
 
 type cachedToken struct {
@@ -85,6 +126,24 @@ var noActiveSessionLogState = struct {
 
 const noActiveSessionLogInterval = 5 * time.Minute
 
+var orchidsFetchClerkInfoWithSession = clerk.FetchAccountInfoWithSessionContextProxy
+var orchidsFetchClerkInfoWithProjectAndSession = clerk.FetchAccountInfoWithProjectAndSessionContextProxy
+
+func traceIDForLog(req upstream.UpstreamRequest) string {
+	traceID := strings.TrimSpace(req.TraceID)
+	if traceID == "" {
+		return "unknown"
+	}
+	return traceID
+}
+
+func attemptForLog(req upstream.UpstreamRequest) int {
+	if req.Attempt <= 0 {
+		return 1
+	}
+	return req.Attempt
+}
+
 func shouldLogNoActiveSession(key string) bool {
 	if strings.TrimSpace(key) == "" {
 		key = "default"
@@ -100,38 +159,30 @@ func shouldLogNoActiveSession(key string) bool {
 }
 
 func newHTTPClient(cfg *config.Config) *http.Client {
-	transport := &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   100,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-		ResponseHeaderTimeout: 30 * time.Second,
+	var proxyFunc func(*http.Request) (*url.URL, error)
+	proxyKey := "direct"
+
+	if cfg != nil {
+		proxyFunc = util.ProxyFuncFromConfig(cfg)
+		proxyKey = util.GenerateProxyKeyFromConfig(cfg)
+	} else {
+		proxyFunc = http.ProxyFromEnvironment
 	}
 
-	if cfg != nil && cfg.ProxyHTTP != "" {
-		if u, err := url.Parse(cfg.ProxyHTTP); err == nil {
-			if cfg.ProxyUser != "" && cfg.ProxyPass != "" {
-				u.User = url.UserPassword(cfg.ProxyUser, cfg.ProxyPass)
-			}
-			transport.Proxy = http.ProxyURL(u)
-		}
-	}
-
-	return &http.Client{
-		Transport: transport,
-	}
+	// Use shared http.Client to preserve connection pool TCP/TLS cache.
+	return util.GetSharedHTTPClient(proxyKey, 30*time.Second, proxyFunc)
 }
 
 func New(cfg *config.Config) *Client {
 	c := &Client{
 		config:     cfg,
 		httpClient: newHTTPClient(cfg),
-		fsCache:    perf.NewTTLCache(60*time.Second, 5000),
 	}
-	c.wsPool = upstream.NewWSPool(c.createWSConnection, 5, 20)
 	return c
+}
+
+func (c *Client) OwnsFinalSSELifecycle() bool {
+	return true
 }
 
 func NewFromAccount(acc *store.Account, base *config.Config) *Client {
@@ -167,8 +218,12 @@ func NewFromAccount(acc *store.Account, base *config.Config) *Client {
 		cfg.MaxRetries = base.MaxRetries
 		cfg.RetryDelay = base.RetryDelay
 		cfg.RequestTimeout = base.RequestTimeout
+		cfg.SuppressThinking = base.SuppressThinking
+		cfg.OrchidsMaxToolResults = base.OrchidsMaxToolResults
+		cfg.OrchidsMaxHistoryMessages = base.OrchidsMaxHistoryMessages
 
 		// Copy Proxy Config
+		cfg.ProxyURL = base.ProxyURL
 		cfg.ProxyHTTP = base.ProxyHTTP
 		cfg.ProxyHTTPS = base.ProxyHTTPS
 		cfg.ProxyUser = base.ProxyUser
@@ -180,10 +235,43 @@ func NewFromAccount(acc *store.Account, base *config.Config) *Client {
 		config:     cfg,
 		account:    acc,
 		httpClient: newHTTPClient(cfg),
-		fsCache:    perf.NewTTLCache(60*time.Second, 5000),
 	}
-	c.wsPool = upstream.NewWSPool(c.createWSConnection, 5, 20)
 	return c
+}
+
+func (c *Client) Close() {
+	if c == nil {
+		return
+	}
+}
+
+func (c *Client) wsConnectionKey() string {
+	parts := make([]string, 0, 4)
+
+	if c.account != nil && c.account.ID != 0 {
+		parts = append(parts, fmt.Sprintf("account:%d", c.account.ID))
+	}
+
+	if c.config != nil {
+		if sessionID := strings.TrimSpace(c.config.SessionID); sessionID != "" {
+			parts = append(parts, "session:"+sessionID)
+		} else if email := strings.ToLower(strings.TrimSpace(c.config.Email)); email != "" {
+			parts = append(parts, "email:"+email)
+		}
+
+		if wsURL := strings.TrimSpace(c.config.OrchidsWSURL); wsURL != "" {
+			parts = append(parts, "ws:"+wsURL)
+		}
+
+		if proxyKey := util.GenerateProxyKeyFromConfig(c.config); proxyKey != "" {
+			parts = append(parts, "proxy:"+proxyKey)
+		}
+	}
+
+	if len(parts) == 0 {
+		return "orchids:default"
+	}
+	return strings.Join(parts, "|")
 }
 
 func (c *Client) GetToken() (string, error) {
@@ -194,7 +282,94 @@ func (c *Client) GetToken() (string, error) {
 		return c.config.UpstreamToken, nil
 	}
 
+	var accountClerkInfoAttempted bool
+	var accountClerkInfoErr error
+
+	// Orchids OAuth: if we have a legacy __client cookie, prefer fetching
+	// Clerk /v1/client and using sessions[0].last_active_token.jwt.
+	// That token is typically short-lived, so we cache by sessionID using its exp claim.
+	if c.account != nil {
+		c.syncConfigFromStoredAccount()
+		if strings.TrimSpace(c.account.ClientCookie) == "" && strings.TrimSpace(c.account.SessionCookie) != "" {
+			_ = c.bootstrapClientCookieFromSession()
+			c.syncConfigFromStoredAccount()
+		}
+		if cached, ok := getCachedToken(strings.TrimSpace(c.account.SessionID)); ok {
+			return cached, nil
+		}
+		if tok := strings.TrimSpace(c.account.Token); tok != "" && tokenStillUsable(tok) {
+			if sid := strings.TrimSpace(c.account.SessionID); sid != "" {
+				setCachedToken(sid, tok)
+			}
+			return tok, nil
+		}
+
+		if strings.TrimSpace(c.account.ClientCookie) != "" {
+			accountClerkInfoAttempted = true
+			info, err := orchidsFetchClerkInfoWithSession(c.account.ClientCookie, c.account.SessionCookie, c.config.ClientUat, c.config.SessionID, orchidsProxyFunc(c.config))
+			if err == nil && info != nil {
+				// Update runtime config (used by some upstream payload fields)
+				c.applyAccountInfo(info)
+				// Persist rotated __client and identity fields back to store account snapshot
+				c.persistAccountInfo(info)
+				if jwt := strings.TrimSpace(info.JWT); jwt != "" {
+					if sid := strings.TrimSpace(info.SessionID); sid != "" {
+						setCachedToken(sid, jwt)
+					}
+					slog.Debug("Orchids token source", "source", "clerk_client_last_active_token", "session_id", info.SessionID, "has_session_cookie", strings.TrimSpace(c.account.SessionCookie) != "")
+					return jwt, nil
+				}
+				if strings.TrimSpace(info.SessionID) != "" {
+					// Ensure config has the latest session id/cookies then fetch a bearer token
+					// via the official Clerk tokens endpoint.
+					c.config.SessionID = strings.TrimSpace(info.SessionID)
+					bearer, tokErr := c.fetchToken()
+					if tokErr == nil && strings.TrimSpace(bearer) != "" {
+						setCachedToken(info.SessionID, bearer)
+						slog.Debug("Orchids token source", "source", "clerk_session_tokens_endpoint", "session_id", info.SessionID, "has_session_cookie", strings.TrimSpace(c.account.SessionCookie) != "")
+						return bearer, nil
+					}
+					if tokErr != nil {
+						slog.Warn("Orchids token fetch: tokens endpoint failed", "session_id", info.SessionID, "error", tokErr)
+					}
+				}
+				// Info returned but missing JWT/sessionID.
+				slog.Warn("Orchids token fetch: clerk info missing jwt/session", "has_jwt", strings.TrimSpace(info.JWT) != "", "session_id", info.SessionID)
+			} else if err != nil {
+				accountClerkInfoErr = err
+				lower := strings.ToLower(err.Error())
+				if strings.Contains(lower, "no active sessions found") {
+					logKey := "clerk_info"
+					if c.account != nil {
+						logKey = fmt.Sprintf("clerk_info:acct:%d", c.account.ID)
+					}
+					if shouldLogNoActiveSession(logKey) {
+						slog.Debug("Orchids token fetch: clerk info failed (no active sessions)", "error", err)
+					}
+				} else {
+					slog.Warn("Orchids token fetch: clerk info failed", "error", err)
+				}
+			}
+			// If Clerk fetch fails, fall back to any stored token below.
+		}
+
+		// Per-account JWT: allow using a pasted bearer token directly.
+		if tok := strings.TrimSpace(c.account.Token); tok != "" {
+			return tok, nil
+		}
+
+		c.syncConfigFromStoredAccount()
+	}
+
 	if c.config.AutoRefreshToken {
+		if accountClerkInfoAttempted {
+			if strings.TrimSpace(c.config.SessionID) != "" {
+				return c.fetchToken()
+			}
+			if accountClerkInfoErr != nil {
+				return "", accountClerkInfoErr
+			}
+		}
 		return c.forceRefreshToken()
 	}
 
@@ -202,7 +377,18 @@ func (c *Client) GetToken() (string, error) {
 		return cached, nil
 	}
 
+	if accountClerkInfoErr != nil && strings.TrimSpace(c.config.SessionID) == "" {
+		return "", accountClerkInfoErr
+	}
+
 	return c.fetchToken()
+}
+
+func (c *Client) GetChatToken() (string, error) {
+	if c == nil || c.config == nil {
+		return "", errors.New("missing config")
+	}
+	return c.getChatToken()
 }
 
 func (c *Client) forceRefreshToken() (string, error) {
@@ -211,7 +397,7 @@ func (c *Client) forceRefreshToken() (string, error) {
 	}
 
 	if strings.TrimSpace(c.config.ClientCookie) != "" {
-		info, err := clerk.FetchAccountInfoWithProjectAndSession(c.config.ClientCookie, c.config.SessionCookie, c.config.ProjectID)
+		info, err := orchidsFetchClerkInfoWithProjectAndSession(c.config.ClientCookie, c.config.SessionCookie, c.config.ClientUat, c.config.SessionID, c.config.ProjectID, orchidsProxyFunc(c.config))
 		if err == nil && info.JWT != "" {
 			c.applyAccountInfo(info)
 			c.persistAccountInfo(info)
@@ -259,7 +445,7 @@ func (c *Client) fetchToken() (string, error) {
 	url := fmt.Sprintf("%s/v1/client/sessions/%s/tokens?__clerk_api_version=%s&_clerk_js_version=%s",
 		clerk.ClerkBaseURL, sid, clerk.ClerkAPIVersion, clerk.ClerkJSVersion)
 
-	ctx, cancel := withDefaultTimeout(context.Background(), c.requestTimeout())
+	ctx, cancel := util.WithDefaultTimeout(context.Background(), c.requestTimeout())
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, "POST", url, strings.NewReader("organization_id="))
@@ -268,7 +454,9 @@ func (c *Client) fetchToken() (string, error) {
 	}
 
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Cookie", c.config.GetCookies())
+	if cookieHeader := orchidsClerkCookieHeader(c.config.ClientCookie, c.config.SessionCookie, c.config.ClientUat, c.config.SessionID); cookieHeader != "" {
+		req.Header.Set("Cookie", cookieHeader)
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -317,6 +505,33 @@ func (c *Client) applyAccountInfo(info *clerk.AccountInfo) {
 	}
 }
 
+func (c *Client) syncConfigFromStoredAccount() {
+	if c == nil || c.config == nil || c.account == nil {
+		return
+	}
+	if strings.TrimSpace(c.config.SessionID) == "" && strings.TrimSpace(c.account.SessionID) != "" {
+		c.config.SessionID = strings.TrimSpace(c.account.SessionID)
+	}
+	if strings.TrimSpace(c.config.ClientCookie) == "" && strings.TrimSpace(c.account.ClientCookie) != "" {
+		c.config.ClientCookie = strings.TrimSpace(c.account.ClientCookie)
+	}
+	if strings.TrimSpace(c.config.SessionCookie) == "" && strings.TrimSpace(c.account.SessionCookie) != "" {
+		c.config.SessionCookie = strings.TrimSpace(c.account.SessionCookie)
+	}
+	if strings.TrimSpace(c.config.ClientUat) == "" && strings.TrimSpace(c.account.ClientUat) != "" {
+		c.config.ClientUat = strings.TrimSpace(c.account.ClientUat)
+	}
+	if strings.TrimSpace(c.config.ProjectID) == "" && strings.TrimSpace(c.account.ProjectID) != "" {
+		c.config.ProjectID = strings.TrimSpace(c.account.ProjectID)
+	}
+	if strings.TrimSpace(c.config.UserID) == "" && strings.TrimSpace(c.account.UserID) != "" {
+		c.config.UserID = strings.TrimSpace(c.account.UserID)
+	}
+	if strings.TrimSpace(c.config.Email) == "" && strings.TrimSpace(c.account.Email) != "" {
+		c.config.Email = strings.TrimSpace(c.account.Email)
+	}
+}
+
 // persistAccountInfo 将刷新后的账号信息同步回 store，防止重启后丢失。
 func (c *Client) persistAccountInfo(info *clerk.AccountInfo) {
 	if c.account == nil || info == nil {
@@ -340,21 +555,12 @@ func (c *Client) persistAccountInfo(info *clerk.AccountInfo) {
 	if strings.TrimSpace(info.ClientCookie) != "" {
 		c.account.ClientCookie = info.ClientCookie
 	}
+	if strings.TrimSpace(info.JWT) != "" {
+		c.account.Token = info.JWT
+	}
 }
 
-// SyncAccountState 检查 forceRefreshToken 是否更新了账号信息，返回是否有实际变更。
-// 通过快照比较避免基于 UpdatedAt 的不可靠检测。
-func (c *Client) SyncAccountState(snapshot *store.Account) bool {
-	if c.account == nil || snapshot == nil {
-		return false
-	}
-	return c.account.SessionID != snapshot.SessionID ||
-		c.account.ClientUat != snapshot.ClientUat ||
-		c.account.ProjectID != snapshot.ProjectID ||
-		c.account.UserID != snapshot.UserID ||
-		c.account.Email != snapshot.Email ||
-		c.account.ClientCookie != snapshot.ClientCookie
-}
+// (method SyncAccountState removed to use store.Account.SyncState logic)
 
 func (c *Client) SendRequest(ctx context.Context, prompt string, chatHistory []interface{}, model string, onMessage func(upstream.SSEMessage), logger *debug.Logger) error {
 	req := upstream.UpstreamRequest{
@@ -371,234 +577,58 @@ func (c *Client) SendRequestWithPayload(ctx context.Context, req upstream.Upstre
 		return errors.New("orchids client is nil")
 	}
 	cfg := c.config
-	mode := ""
 	timeout := 120
-	debugEnabled := false
 	if cfg != nil {
-		mode = strings.ToLower(strings.TrimSpace(cfg.UpstreamMode))
 		if cfg.RequestTimeout > 0 {
 			timeout = cfg.RequestTimeout
 		}
-		debugEnabled = cfg.DebugEnabled
 	}
-	if debugEnabled {
-		slog.Debug("Sending upstream request", "mode", mode, "url", c.upstreamURL(), "timeout", timeout)
+	transport := c.resolveTransport()
+	if logutil.VerboseDiagnosticsEnabled() {
+		slog.Debug("Sending upstream request", "trace_id", traceIDForLog(req), "attempt", attemptForLog(req), "transport", transport, "url", c.upstreamURL(), "timeout", timeout)
 	}
-	if mode == "ws" || mode == "websocket" {
-		err := c.sendRequestWSAIClient(ctx, req, onMessage, logger)
-		if err != nil {
-			if isWSFallback(err) && ctx.Err() == nil {
-				if logger != nil {
-					logger.LogUpstreamSSE("ws_fallback", err.Error())
-				}
-				return c.sendRequestSSE(ctx, req, onMessage, logger)
-			}
-			return err
-		}
+	if logutil.VerboseDiagnosticsEnabled() {
+		slog.Debug("Orchids transport dispatch", "trace_id", traceIDForLog(req), "attempt", attemptForLog(req), "transport", transport, "chat_session_id", req.ChatSessionID, "model", req.Model)
+	}
+	err := c.dispatchTransport(ctx, transport, req, onMessage, logger)
+	if err == nil {
 		return nil
 	}
-	return c.sendRequestSSE(ctx, req, onMessage, logger)
+	if transport == orchidsTransportWS && isWSFallback(err) && ctx.Err() == nil && shouldFallbackFromWSToSSE(err) {
+		slog.Warn("Orchids transport fallback", "trace_id", traceIDForLog(req), "attempt", attemptForLog(req), "from", orchidsTransportWS, "to", orchidsTransportSSE, "chat_session_id", req.ChatSessionID, "error", err)
+		if logger != nil {
+			logger.LogUpstreamSSE("ws_fallback", err.Error())
+		}
+		return c.dispatchTransport(ctx, orchidsTransportSSE, req, onMessage, logger)
+	}
+	return err
 }
 
-func (c *Client) sendRequestSSE(ctx context.Context, req upstream.UpstreamRequest, onMessage func(upstream.SSEMessage), logger *debug.Logger) error {
-	if c == nil {
-		return errors.New("orchids client is nil")
+func extractOrchidsFastText(msg orchidsFastTextMessage) string {
+	if msg.Delta != "" {
+		return msg.Delta
 	}
-	cfg := c.config
-	debugEnabled := cfg != nil && cfg.DebugEnabled
-	timeout := 120 * time.Second
-	if cfg != nil && cfg.RequestTimeout > 0 {
-		timeout = time.Duration(cfg.RequestTimeout) * time.Second
+	if msg.Text != "" {
+		return msg.Text
 	}
-
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	token, err := c.GetToken()
-	if err != nil {
-		return fmt.Errorf("failed to get token: %w", err)
+	if msg.Data.Text != "" {
+		return msg.Data.Text
 	}
-
-	payloadMessages := req.Messages
-	payloadSystem := req.System
-	if cfg != nil && strings.EqualFold(strings.TrimSpace(cfg.OrchidsImpl), "aiclient") {
-		// AIClient 模式：避免 prompt + messages 双份注入上下文
-		payloadMessages = nil
-		payloadSystem = nil
+	if len(msg.Chunk) == 0 {
+		return ""
 	}
-	projectID := ""
-	agentMode := ""
-	email := ""
-	userID := ""
-	if cfg != nil {
-		projectID = cfg.ProjectID
-		agentMode = cfg.AgentMode
-		email = cfg.Email
-		userID = cfg.UserID
+	var chunkText string
+	if err := json.Unmarshal(msg.Chunk, &chunkText); err == nil {
+		return chunkText
 	}
-
-	payload := AgentRequest{
-		Prompt:        req.Prompt,
-		ChatHistory:   req.ChatHistory,
-		ProjectID:     projectID,
-		CurrentPage:   map[string]interface{}{},
-		AgentMode:     agentMode,
-		Mode:          "agent",
-		GitRepoUrl:    "",
-		Email:         email,
-		ChatSessionID: req.ChatSessionID,
-		UserID:        userID,
-		APIVersion:    2,
-		Model:         req.Model,
-		Messages:      payloadMessages,
-		System:        payloadSystem,
-		Tools:         req.Tools,
+	var chunk orchidsFastChunk
+	if err := json.Unmarshal(msg.Chunk, &chunk); err != nil {
+		return ""
 	}
-	if payload.ChatSessionID == "" {
-		payload.ChatSessionID = fmt.Sprintf("chat_%d", rand.IntN(90000000)+10000000)
+	if chunk.Text != "" {
+		return chunk.Text
 	}
-
-	buf := perf.AcquireByteBuffer()
-	defer perf.ReleaseByteBuffer(buf)
-
-	if err := json.NewEncoder(buf).Encode(payload); err != nil {
-		return err
-	}
-
-	url := c.upstreamURL()
-
-	// 使用 Circuit Breaker 保护上游调用
-	breaker := upstream.GetAccountBreaker(email)
-	start := time.Now()
-
-	result, err := breaker.Execute(func() (interface{}, error) {
-		httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(buf.Bytes()))
-		if err != nil {
-			return nil, err
-		}
-
-		httpReq.Header.Set("Accept", "text/event-stream")
-		httpReq.Header.Set("Authorization", "Bearer "+token)
-		httpReq.Header.Set("Content-Type", "application/json")
-		httpReq.Header.Set("X-Orchids-Api-Version", "2")
-
-		// 记录上游请求
-		if logger != nil {
-			headers := map[string]string{
-				"Accept":                "text/event-stream",
-				"Authorization":         "Bearer [REDACTED]",
-				"Content-Type":          "application/json",
-				"X-Orchids-Api-Version": "2",
-			}
-			logger.LogUpstreamRequest(url, headers, payload)
-		}
-
-		return c.httpClient.Do(httpReq)
-	})
-
-	if err != nil {
-		if logger != nil {
-			logger.LogUpstreamHTTPError(url, 0, "", err)
-		}
-		if debugEnabled {
-			slog.Info("[Performance] Upstream Request Failed", "duration", time.Since(start), "error", err)
-		}
-		return err
-	}
-	if debugEnabled {
-		slog.Info("[Performance] Upstream Request Headers Received", "duration", time.Since(start))
-	}
-	resp := result.(*http.Response)
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return fmt.Errorf("upstream request failed with status %d (failed to read error body: %v)", resp.StatusCode, err)
-		}
-		return fmt.Errorf("upstream request failed with status %d: %s", resp.StatusCode, string(body))
-	}
-
-	limitedBody := resp.Body
-
-	reader := perf.AcquireBufioReader(limitedBody)
-	defer perf.ReleaseBufioReader(reader)
-
-	buffer := perf.AcquireStringBuilder()
-	defer perf.ReleaseStringBuilder(buffer)
-
-	var state requestState
-	var fsWG sync.WaitGroup
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return err
-		}
-
-		buffer.WriteString(line)
-
-		if line == "\n" {
-			eventData := buffer.String()
-			buffer.Reset()
-
-			lines := strings.Split(eventData, "\n")
-			for _, l := range lines {
-				if strings.HasPrefix(l, "data: ") {
-					rawData := strings.TrimPrefix(l, "data: ")
-
-					var msg map[string]interface{}
-					if err := json.Unmarshal([]byte(rawData), &msg); err != nil {
-						continue
-					}
-
-					if shouldBreak := c.handleOrchidsMessage(msg, []byte(rawData), &state, onMessage, logger, nil, &fsWG, req.Workdir); shouldBreak {
-						goto done
-					}
-				}
-			}
-		}
-	}
-
-done:
-	if state.errorMsg != "" {
-		return fmt.Errorf("orchids upstream error: %s", state.errorMsg)
-	}
-
-	if !state.finishSent {
-		finishReason := "stop"
-		if state.sawToolCall {
-			finishReason = "tool-calls"
-		}
-		onMessage(upstream.SSEMessage{Type: "model", Event: map[string]interface{}{"type": "finish", "finishReason": finishReason}})
-	}
-
-	if state.hasFSOps {
-		// Wait for FS operations with timeout
-		fsDone := make(chan struct{})
-		go func() {
-			fsWG.Wait()
-			close(fsDone)
-		}()
-		select {
-		case <-fsDone:
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(10 * time.Second):
-			slog.Warn("FS operations timed out in SSE mode")
-		}
-	}
-
-	return nil
+	return chunk.Content
 }
 
 type UpstreamModel struct {
@@ -608,9 +638,34 @@ type UpstreamModel struct {
 	OwnedBy string `json:"owned_by"`
 }
 
-type UpstreamModelsResponse struct {
+type upstreamModelsEnvelope struct {
 	Object string          `json:"object"`
 	Data   []UpstreamModel `json:"data"`
+	Models []UpstreamModel `json:"models"`
+}
+
+func decodeUpstreamModelsResponse(body []byte) ([]UpstreamModel, error) {
+	var envelope upstreamModelsEnvelope
+	envelopeErr := json.Unmarshal(body, &envelope)
+	if envelopeErr == nil {
+		if envelope.Data != nil {
+			return envelope.Data, nil
+		}
+		if envelope.Models != nil {
+			return envelope.Models, nil
+		}
+	}
+
+	var direct []UpstreamModel
+	directErr := json.Unmarshal(body, &direct)
+	if directErr == nil {
+		return direct, nil
+	}
+
+	if envelopeErr != nil {
+		return nil, envelopeErr
+	}
+	return nil, directErr
 }
 
 func (c *Client) FetchUpstreamModels(ctx context.Context) ([]UpstreamModel, error) {
@@ -619,12 +674,12 @@ func (c *Client) FetchUpstreamModels(ctx context.Context) ([]UpstreamModel, erro
 		return nil, fmt.Errorf("failed to get token: %w", err)
 	}
 
-	ctx, cancel := withDefaultTimeout(ctx, c.requestTimeout())
+	ctx, cancel := util.WithDefaultTimeout(ctx, c.requestTimeout())
 	defer cancel()
 
 	// Replace /agent/coding-agent with /v1/models if needed, or just append /v1/models if base is different
 	baseURL := defaultUpstreamBaseURL
-	if c.config != nil && c.config.OrchidsAPIBaseURL != "" {
+	if c.config != nil {
 		baseURL = c.config.OrchidsAPIBaseURL
 	}
 	baseURL = strings.TrimSuffix(baseURL, "/")
@@ -648,14 +703,18 @@ func (c *Client) FetchUpstreamModels(ctx context.Context) ([]UpstreamModel, erro
 		}
 
 		if resp.StatusCode == http.StatusOK {
-			var parsed UpstreamModelsResponse
-			if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
-				resp.Body.Close()
-				// Try parsing as just []UpstreamModel
-				return nil, err
-			}
+			body, readErr := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			return parsed.Data, nil
+			if readErr != nil {
+				lastErr = readErr
+				continue
+			}
+			models, decodeErr := decodeUpstreamModelsResponse(body)
+			if decodeErr != nil {
+				lastErr = fmt.Errorf("upstream models decode failed for %s: %w", p, decodeErr)
+				continue
+			}
+			return models, nil
 		}
 
 		// Read body for error details
@@ -686,19 +745,13 @@ func (c *Client) requestTimeout() time.Duration {
 	return 30 * time.Second
 }
 
-func withDefaultTimeout(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
-	if timeout <= 0 {
-		return context.WithCancel(ctx)
-	}
-	if _, ok := ctx.Deadline(); ok {
-		return context.WithCancel(ctx)
-	}
-	return context.WithTimeout(ctx, timeout)
-}
-
 func isWSFallback(err error) bool {
 	var fallback wsFallbackError
 	return errors.As(err, &fallback)
+}
+
+func shouldFallbackFromWSToSSE(err error) bool {
+	return !apperrors.IsAccountAuthFailure(err)
 }
 
 func getCachedToken(sessionID string) (string, bool) {
@@ -755,42 +808,14 @@ func InvalidateCachedToken(sessionID string) {
 }
 
 func tokenExpiry(token string) time.Time {
-	firstDot := strings.IndexByte(token, '.')
-	if firstDot < 0 {
-		return time.Time{}
-	}
-	rest := token[firstDot+1:]
-	secondDot := strings.IndexByte(rest, '.')
-	if secondDot < 0 {
-		return time.Time{}
-	}
+	return util.JWTExpiry(token, tokenExpirySkew)
+}
 
-	payload, err := base64.RawURLEncoding.DecodeString(rest[:secondDot])
-	if err != nil {
-		return time.Time{}
+func tokenStillUsable(token string) bool {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return false
 	}
-
-	var claims map[string]interface{}
-	if err := json.Unmarshal(payload, &claims); err != nil {
-		return time.Time{}
-	}
-
-	expValue, ok := claims["exp"]
-	if !ok {
-		return time.Time{}
-	}
-
-	var exp int64
-	switch v := expValue.(type) {
-	case float64:
-		exp = int64(v)
-	case json.Number:
-		exp, _ = v.Int64() // Error ignored as we return 0 on failure anyway
-	}
-
-	if exp == 0 {
-		return time.Time{}
-	}
-
-	return time.Unix(exp, 0).Add(-tokenExpirySkew)
+	expiresAt := tokenExpiry(token)
+	return expiresAt.IsZero() || time.Now().Before(expiresAt)
 }

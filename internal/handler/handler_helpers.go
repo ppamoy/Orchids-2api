@@ -3,25 +3,132 @@ package handler
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
+	apperrors "orchids-api/internal/errors"
 	"orchids-api/internal/orchids"
 	"orchids-api/internal/store"
 	"orchids-api/internal/warp"
 )
+
+var modelVersionHyphenAlias = regexp.MustCompile(`-(\d{1,2})-(\d{1,2})`)
+var modelVersionDotAlias = regexp.MustCompile(`-(\d{1,2})\.(\d{1,2})`)
+
+func resolveModelAliasCandidates(modelID string) []string {
+	modelID = strings.ToLower(strings.TrimSpace(modelID))
+	if modelID == "" {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	add := func(v string, out *[]string) {
+		v = strings.ToLower(strings.TrimSpace(v))
+		if v == "" {
+			return
+		}
+		if _, ok := seen[v]; ok {
+			return
+		}
+		seen[v] = struct{}{}
+		*out = append(*out, v)
+	}
+
+	out := make([]string, 0, 3)
+	add(modelID, &out)
+	add(modelVersionHyphenAlias.ReplaceAllString(modelID, "-$1.$2"), &out)
+	add(modelVersionDotAlias.ReplaceAllString(modelID, "-$1-$2"), &out)
+	return out
+}
+
+func (h *Handler) resolveModelAlias(ctx context.Context, modelID string) (string, *store.Model) {
+	if h == nil || h.loadBalancer == nil || h.loadBalancer.Store == nil {
+		return modelID, nil
+	}
+	candidates := resolveModelAliasCandidates(modelID)
+	if len(candidates) == 0 {
+		return modelID, nil
+	}
+	var fallbackID string
+	var fallbackModel *store.Model
+	for _, cand := range candidates {
+		if m, err := h.loadBalancer.Store.GetModelByModelID(ctx, cand); err == nil && m != nil {
+			if m.Status.Enabled() {
+				return cand, m
+			}
+			if fallbackModel == nil {
+				fallbackID = cand
+				fallbackModel = m
+			}
+		}
+	}
+	if fallbackModel != nil {
+		return fallbackID, fallbackModel
+	}
+	return modelID, nil
+}
+
+func uniqueModelCandidates(values ...string) []string {
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.ToLower(strings.TrimSpace(value))
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
+}
+
+func (h *Handler) resolveModelAliasForChannel(ctx context.Context, channel, modelID string) (string, *store.Model) {
+	if h == nil || h.loadBalancer == nil || h.loadBalancer.Store == nil {
+		return modelID, nil
+	}
+
+	candidates := resolveModelAliasCandidates(modelID)
+	if strings.EqualFold(channel, "warp") {
+		if mapped := warp.ResolveModelAlias(modelID); mapped != "" {
+			candidates = append(resolveModelAliasCandidates(mapped), candidates...)
+		}
+	}
+	candidates = uniqueModelCandidates(candidates...)
+
+	var fallbackID string
+	var fallbackModel *store.Model
+	for _, cand := range candidates {
+		m, err := h.loadBalancer.Store.GetModelByChannelAndModelID(ctx, channel, cand)
+		if err != nil || m == nil {
+			continue
+		}
+		if m.Status.Enabled() {
+			return cand, m
+		}
+		if fallbackModel == nil {
+			fallbackID = cand
+			fallbackModel = m
+		}
+	}
+	if fallbackModel != nil {
+		return fallbackID, fallbackModel
+	}
+	return modelID, nil
+}
 
 // resolveWorkdir determines the working directory from headers, system prompt, or session.
 // 返回当前 workdir、上一轮 workdir、以及是否发生变更。
 func (h *Handler) resolveWorkdir(r *http.Request, req ClaudeRequest, conversationKey string) (string, string, bool) {
 	prevWorkdir := ""
 	if conversationKey != "" {
-		h.sessionWorkdirsMu.RLock()
-		prevWorkdir = h.sessionWorkdirs[conversationKey]
-		h.sessionWorkdirsMu.RUnlock()
+		prevWorkdir, _ = h.sessionStore.GetWorkdir(r.Context(), conversationKey)
 	}
 
 	// Prefer explicit workdir from request payload/header/system.
@@ -40,20 +147,17 @@ func (h *Handler) resolveWorkdir(r *http.Request, req ClaudeRequest, conversatio
 	if dynamicWorkdir == "" && hasExplicitSession && prevWorkdir != "" {
 		dynamicWorkdir = prevWorkdir
 		source = "session"
-		slog.Info("Recovered workdir from session", "workdir", dynamicWorkdir, "session", conversationKey)
+		slog.Debug("Recovered workdir from session", "workdir", dynamicWorkdir, "session", conversationKey)
 	}
 
 	// Persist for future turns in this session
 	if dynamicWorkdir != "" && conversationKey != "" {
-		h.sessionWorkdirsMu.Lock()
-		h.sessionWorkdirs[conversationKey] = dynamicWorkdir
-		h.sessionLastAccess[conversationKey] = time.Now()
-		h.cleanupSessionWorkdirsLocked()
-		h.sessionWorkdirsMu.Unlock()
+		h.sessionStore.SetWorkdir(r.Context(), conversationKey, dynamicWorkdir)
+		h.sessionStore.Touch(r.Context(), conversationKey)
 	}
 
 	if dynamicWorkdir != "" {
-		slog.Info("Using dynamic workdir", "workdir", dynamicWorkdir, "source", source)
+		slog.Debug("Using dynamic workdir", "workdir", dynamicWorkdir, "source", source)
 	}
 	rawPrev := strings.TrimSpace(prevWorkdir)
 	rawNext := strings.TrimSpace(dynamicWorkdir)
@@ -70,53 +174,138 @@ func (h *Handler) resolveWorkdir(r *http.Request, req ClaudeRequest, conversatio
 }
 
 // selectAccount logic extracted from HandleMessages
-func (h *Handler) selectAccount(ctx context.Context, model, forcedChannel string, failedAccountIDs []int64) (UpstreamClient, *store.Account, error) {
+func (h *Handler) selectAccount(ctx context.Context, targetChannel string, channelRequired bool, failedAccountIDs []int64) (UpstreamClient, *store.Account, error) {
 	if h.loadBalancer != nil {
-		targetChannel := forcedChannel
-		if targetChannel == "" {
-			targetChannel = h.loadBalancer.GetModelChannel(ctx, model)
-		}
 		if targetChannel != "" {
-			slog.Info("Model recognition", "model", model, "channel", targetChannel)
+			slog.Debug("Account channel selection", "channel", targetChannel, "channel_required", channelRequired)
 		}
-		account, err := h.loadBalancer.GetNextAccountExcludingByChannel(ctx, failedAccountIDs, targetChannel)
+		account, err := h.loadBalancer.GetNextAccountExcludingByChannelWithTracker(ctx, failedAccountIDs, targetChannel, h.connTracker)
 		if err != nil {
-			if forcedChannel != "" {
+			if channelRequired {
 				return nil, nil, err
 			}
 			if h.client != nil {
-				slog.Info("Load balancer: no available accounts for channel, using default config", "channel", targetChannel)
+				if _, ok := h.client.(*orchids.Client); ok && h.config != nil {
+					h.client = orchids.New(h.config)
+				}
+				slog.Debug("Load balancer: no available accounts for channel, using default config", "channel", targetChannel)
 				return h.client, nil, nil
 			}
 			return nil, nil, err
 		}
-		var client UpstreamClient
-		if strings.EqualFold(account.AccountType, "warp") {
-			client = warp.NewFromAccount(account, h.config)
-		} else {
-			orchidsClient := orchids.NewFromAccount(account, h.config)
-			client = orchidsClient
+		client := h.getOrCreateAccountClient(account)
+		if client == nil {
+			return nil, nil, errors.New("no client configured")
 		}
 		return client, account, nil
 	} else if h.client != nil {
+		if _, ok := h.client.(*orchids.Client); ok && h.config != nil {
+			h.client = orchids.New(h.config)
+		}
 		return h.client, nil, nil
 	}
 	return nil, nil, errors.New("no client configured")
 }
 
+func (h *Handler) acquireTrackedAccount(acc *store.Account) int64 {
+	if acc == nil || acc.ID == 0 {
+		return 0
+	}
+	if h != nil && h.connTracker != nil {
+		h.connTracker.Acquire(acc.ID)
+		return acc.ID
+	}
+	if h != nil && h.loadBalancer != nil {
+		h.loadBalancer.AcquireConnection(acc.ID)
+		return acc.ID
+	}
+	return 0
+}
+
+func (h *Handler) releaseTrackedAccount(accountID int64) {
+	if accountID == 0 {
+		return
+	}
+	if h != nil && h.connTracker != nil {
+		h.connTracker.Release(accountID)
+		return
+	}
+	if h != nil && h.loadBalancer != nil {
+		h.loadBalancer.ReleaseConnection(accountID)
+	}
+}
+
+func (h *Handler) validateModelAvailability(ctx context.Context, modelID, forcedChannel string) (*store.Model, error) {
+	if h == nil || h.loadBalancer == nil || h.loadBalancer.Store == nil {
+		return nil, nil
+	}
+	modelID = strings.TrimSpace(modelID)
+	if modelID == "" {
+		return nil, nil
+	}
+	var (
+		resolvedModelID string
+		m               *store.Model
+	)
+	if forcedChannel != "" {
+		resolvedModelID, m = h.resolveModelAliasForChannel(ctx, forcedChannel, modelID)
+	} else {
+		resolvedModelID, m = h.resolveModelAlias(ctx, modelID)
+		if strings.EqualFold(forcedChannel, "warp") {
+			if mapped := warp.ResolveModelAlias(resolvedModelID); mapped != "" {
+				resolvedModelID = mapped
+				if m == nil || !strings.EqualFold(strings.TrimSpace(m.ModelID), resolvedModelID) {
+					resolved, err := h.loadBalancer.Store.GetModelByModelID(ctx, resolvedModelID)
+					if err == nil {
+						m = resolved
+					}
+				}
+			}
+		}
+	}
+	if m == nil {
+		return nil, fmt.Errorf("model not found")
+	}
+	if !m.Status.Enabled() {
+		return nil, fmt.Errorf("model not available")
+	}
+	if forcedChannel != "" {
+		mChannel := strings.TrimSpace(m.Channel)
+		if mChannel == "" {
+			mChannel = "orchids"
+		}
+		if !sameModelChannel(mChannel, forcedChannel) {
+			return nil, fmt.Errorf("model not found")
+		}
+	}
+	return m, nil
+}
+
+func sameModelChannel(a, b string) bool {
+	normalize := func(value string) string {
+		value = strings.ToLower(strings.TrimSpace(value))
+		value = strings.ReplaceAll(value, "_", "-")
+		value = strings.ReplaceAll(value, " ", "-")
+		if value == "" {
+			return "orchids"
+		}
+		return value
+	}
+	return normalize(a) == normalize(b)
+}
+
 func (h *Handler) updateAccountStats(account *store.Account, inputTokens, outputTokens int) {
-	if account == nil || h.loadBalancer == nil {
+	if account == nil || h.loadBalancer == nil || h.loadBalancer.Store == nil {
 		return
 	}
 	go func(accountID int64, inputTokens, outputTokens int) {
 		usage := float64(inputTokens + outputTokens)
-		if usage > 0 {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			// Use the new batched method
-			if err := h.loadBalancer.Store.IncrementAccountStats(ctx, accountID, usage, 1); err != nil {
-				slog.Error("Failed to update account stats", "account_id", accountID, "error", err)
-			}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		// Count each completed request exactly once here. This avoids the old
+		// pre-selection increment plus post-response stats update double-counting.
+		if err := h.loadBalancer.Store.IncrementAccountStats(ctx, accountID, usage, 1); err != nil {
+			slog.Error("Failed to update account stats", "account_id", accountID, "error", err)
 		}
 	}(account.ID, inputTokens, outputTokens)
 }
@@ -131,9 +320,9 @@ func (h *Handler) syncWarpState(account *store.Account, client UpstreamClient, s
 		if warpClient, ok := client.(*warp.Client); ok {
 			changed = warpClient.SyncAccountState()
 		}
-	} else if orchidsClient, ok := client.(*orchids.Client); ok {
+	} else if _, ok := client.(*orchids.Client); ok {
 		// Orchids 账号：通过快照比较检测 forceRefreshToken 是否更新了账号信息
-		changed = orchidsClient.SyncAccountState(snapshot)
+		changed = account.SyncState(snapshot)
 	}
 
 	if changed {
@@ -145,68 +334,61 @@ func (h *Handler) syncWarpState(account *store.Account, client UpstreamClient, s
 	}
 }
 
-const (
-	sessionMaxSize         = 1024
-	sessionCleanupInterval = 5 * time.Minute
-	sessionMaxAge          = 30 * time.Minute
-)
+type creditRefundClient interface {
+	RefundCredits(ctx context.Context, reason string) error
+}
 
-// cleanupSessionWorkdirsLocked removes stale session entries.
-// Must be called with sessionWorkdirsMu held for writing.
-func (h *Handler) cleanupSessionWorkdirsLocked() {
-	now := time.Now()
-	if len(h.sessionWorkdirs) < sessionMaxSize && now.Sub(h.sessionCleanupRun) < sessionCleanupInterval {
+func shouldRefundWarpCredits(category string) bool {
+	switch strings.TrimSpace(category) {
+	case "canceled", "timeout", "network", "server", "unknown":
+		return true
+	default:
+		return false
+	}
+}
+
+func refundReasonForWarpCategory(category string) string {
+	switch strings.TrimSpace(category) {
+	case "canceled":
+		return "request_canceled"
+	case "timeout":
+		return "request_timeout"
+	case "network":
+		return "network_error"
+	case "server":
+		return "server_error"
+	default:
+		return "upstream_error"
+	}
+}
+
+func (h *Handler) refundWarpCredits(client UpstreamClient, category string) {
+	if !shouldRefundWarpCredits(category) {
 		return
 	}
-	for key, lastAccess := range h.sessionLastAccess {
-		if now.Sub(lastAccess) > sessionMaxAge {
-			delete(h.sessionWorkdirs, key)
-			delete(h.sessionConvIDs, key)
-			delete(h.sessionLastAccess, key)
-		}
+
+	refundable, ok := client.(creditRefundClient)
+	if !ok {
+		return
 	}
-	h.sessionCleanupRun = now
+
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+
+	reason := refundReasonForWarpCategory(category)
+	if err := refundable.RefundCredits(ctx, reason); err != nil {
+		slog.Warn("Warp refund credits failed", "category", category, "reason", reason, "error", err)
+		return
+	}
+	slog.Debug("Warp credits refunded", "category", category, "reason", reason)
 }
 
-type upstreamErrorClass struct {
-	category      string
-	retryable     bool
-	switchAccount bool
-}
+// upstreamErrorClass is a local alias for the centralized type.
+type upstreamErrorClass = apperrors.UpstreamErrorClass
 
+// classifyUpstreamError delegates to the centralized errors package.
 func classifyUpstreamError(errStr string) upstreamErrorClass {
-	lower := strings.ToLower(errStr)
-	switch {
-	case strings.Contains(lower, "context canceled") || strings.Contains(lower, "canceled"):
-		return upstreamErrorClass{category: "canceled", retryable: false, switchAccount: false}
-	case hasExplicitHTTPStatus(lower, "401") ||
-		strings.Contains(lower, "signed out") || strings.Contains(lower, "signed_out"):
-		return upstreamErrorClass{category: "auth", retryable: true, switchAccount: true}
-	case hasExplicitHTTPStatus(lower, "403"):
-		return upstreamErrorClass{category: "auth_blocked", retryable: true, switchAccount: true}
-	case hasExplicitHTTPStatus(lower, "404"):
-		return upstreamErrorClass{category: "auth_blocked", retryable: false, switchAccount: false}
-	case strings.Contains(lower, "input is too long") || hasExplicitHTTPStatus(lower, "400"):
-		return upstreamErrorClass{category: "client", retryable: false, switchAccount: false}
-	case hasExplicitHTTPStatus(lower, "429") ||
-		strings.Contains(lower, "too many requests") ||
-		strings.Contains(lower, "rate limit") ||
-		strings.Contains(lower, "no remaining quota") ||
-		strings.Contains(lower, "out of credits") ||
-		strings.Contains(lower, "credits exhausted") ||
-		strings.Contains(lower, "run out of credits"):
-		return upstreamErrorClass{category: "rate_limit", retryable: true, switchAccount: true}
-	case strings.Contains(lower, "timeout") || strings.Contains(lower, "deadline exceeded") || strings.Contains(lower, "context deadline"):
-		return upstreamErrorClass{category: "timeout", retryable: true, switchAccount: true}
-	case strings.Contains(lower, "connection reset") || strings.Contains(lower, "connection refused") ||
-		strings.Contains(lower, "unexpected eof") || strings.Contains(lower, "use of closed") ||
-		strings.Contains(lower, "broken pipe") || strings.HasSuffix(lower, ": eof") || lower == "eof":
-		return upstreamErrorClass{category: "network", retryable: true, switchAccount: true}
-	case hasExplicitHTTPStatus(lower, "500") || hasExplicitHTTPStatus(lower, "502") || hasExplicitHTTPStatus(lower, "503") || hasExplicitHTTPStatus(lower, "504"):
-		return upstreamErrorClass{category: "server", retryable: true, switchAccount: true}
-	default:
-		return upstreamErrorClass{category: "unknown", retryable: true, switchAccount: true}
-	}
+	return apperrors.ClassifyUpstreamError(errStr)
 }
 
 func computeRetryDelay(base time.Duration, attempt int, category string) time.Duration {
@@ -227,4 +409,13 @@ func computeRetryDelay(base time.Duration, attempt int, category string) time.Du
 		delay = 30 * time.Second
 	}
 	return delay
+}
+
+func shouldRetryCurrentAccountWhenNoAlternative(category string) bool {
+	switch strings.TrimSpace(category) {
+	case "network", "timeout", "server", "unknown":
+		return true
+	default:
+		return false
+	}
 }

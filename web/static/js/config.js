@@ -2,29 +2,20 @@
 
 let apiKeys = [];
 let createdKeys = [];
+const TOKEN_CACHE_TTL_PRESETS = ["60", "300", "900", "1800", "3600", "86400", "259200", "604800"];
 
 // Switch between config tabs
 function switchConfigTab(tab) {
   document.querySelectorAll("#configTabs .tab-item").forEach(btn => {
     btn.classList.toggle("active",
       (tab === 'basic' && btn.textContent.includes('基础')) ||
-      (tab === 'auth' && btn.textContent.includes('API Key')) ||
-      (tab === 'proxy' && btn.textContent.includes('代理'))
+      (tab === 'auth' && btn.textContent.includes('API Key'))
     );
   });
   document.getElementById("basicConfig").style.display = tab === 'basic' ? 'block' : 'none';
   document.getElementById("authConfig").style.display = tab === 'auth' ? 'block' : 'none';
-  document.getElementById("proxyConfig").style.display = tab === 'proxy' ? 'block' : 'none';
 
   if (tab === 'auth') loadApiKeys();
-}
-
-// Update switch label
-function updateSwitchLabel(el, text) {
-  const span = document.getElementById("label_" + el.id);
-  if (span) {
-    span.textContent = text + (el.checked ? " (已开启)" : " (已关闭)");
-  }
 }
 
 // Toggle password visibility
@@ -43,45 +34,110 @@ function copyFieldValue(fieldId) {
   }
 }
 
+function parseProxyBypass(raw) {
+  if (!raw) return [];
+  return raw
+    .split(/[\n,]/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function normalizeProxyBypass(value) {
+  if (Array.isArray(value)) return value;
+  if (typeof value === "string") return parseProxyBypass(value);
+  return [];
+}
+
+function normalizeTokenCacheTTLValue(raw) {
+  const value = parseInt(raw, 10);
+  if (Number.isFinite(value) && value > 0) {
+    return String(value);
+  }
+  return "300";
+}
+
+function normalizeFlagValue(value) {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "true" || normalized === "1" || normalized === "yes" || normalized === "on") return true;
+    if (normalized === "false" || normalized === "0" || normalized === "no" || normalized === "off") return false;
+  }
+  return !!value;
+}
+
+function syncTokenCacheTTLControls(raw) {
+  const normalized = normalizeTokenCacheTTLValue(raw);
+  const hiddenInput = document.getElementById("cfg_token_cache_ttl");
+  const presetInput = document.getElementById("cfg_token_cache_ttl_preset");
+  const customInput = document.getElementById("cfg_token_cache_ttl_custom");
+  const customWrap = document.getElementById("cfg_token_cache_ttl_custom_wrap");
+  if (!hiddenInput || !presetInput || !customInput || !customWrap) return;
+
+  hiddenInput.value = normalized;
+  customInput.value = normalized;
+  const isPreset = TOKEN_CACHE_TTL_PRESETS.includes(normalized);
+  presetInput.value = isPreset ? normalized : "custom";
+  customWrap.style.display = isPreset ? "none" : "block";
+}
+
+function getTokenCacheTTLValue() {
+  const hiddenInput = document.getElementById("cfg_token_cache_ttl");
+  return normalizeTokenCacheTTLValue(hiddenInput?.value);
+}
+
+function handleTokenCacheTTLPresetChange() {
+  const hiddenInput = document.getElementById("cfg_token_cache_ttl");
+  const presetInput = document.getElementById("cfg_token_cache_ttl_preset");
+  const customInput = document.getElementById("cfg_token_cache_ttl_custom");
+  const customWrap = document.getElementById("cfg_token_cache_ttl_custom_wrap");
+  if (!hiddenInput || !presetInput || !customInput || !customWrap) return;
+
+  if (presetInput.value === "custom") {
+    customWrap.style.display = "block";
+    hiddenInput.value = normalizeTokenCacheTTLValue(customInput.value);
+  } else {
+    customWrap.style.display = "none";
+    hiddenInput.value = normalizeTokenCacheTTLValue(presetInput.value);
+  }
+  updateMemoryEstimation();
+}
+
+function handleTokenCacheTTLCustomInput() {
+  const presetInput = document.getElementById("cfg_token_cache_ttl_preset");
+  const hiddenInput = document.getElementById("cfg_token_cache_ttl");
+  const customInput = document.getElementById("cfg_token_cache_ttl_custom");
+  if (!presetInput || !hiddenInput || !customInput || presetInput.value !== "custom") return;
+
+  hiddenInput.value = normalizeTokenCacheTTLValue(customInput.value);
+  updateMemoryEstimation();
+}
+
 // Load configuration from API
 async function loadConfiguration() {
   try {
-    const res = await fetch("/api/config");
+    const res = await fetch("/api/config/list");
     if (res.status === 401) {
       window.location.href = "./login.html";
       return;
     }
-    const cfg = await res.json();
+    const payload = await res.json();
+    if (payload && typeof payload.code !== "undefined" && payload.code !== 0) {
+      throw new Error(payload.message || payload.msg || "加载配置失败");
+    }
+    const cfg = payload && payload.data ? payload.data : payload;
 
-    document.getElementById("cfg_admin_pass").value = cfg.admin_pass || "";
+    document.getElementById("cfg_admin_pass").value = cfg.admin_password || cfg.admin_pass || "";
     document.getElementById("cfg_admin_token").value = cfg.admin_token || "";
-    document.getElementById("cfg_max_retries").value = cfg.max_retries || 3;
-    document.getElementById("cfg_retry_delay").value = cfg.retry_delay || 1000;
-    document.getElementById("cfg_switch_count").value = cfg.account_switch_count || 5;
-    document.getElementById("cfg_request_timeout").value = cfg.request_timeout || 120;
-    document.getElementById("cfg_refresh_interval").value = cfg.token_refresh_interval || 30;
+    document.getElementById("cfg_proxy_url").value = cfg.proxy_url || "";
+    const proxyBypass = normalizeProxyBypass(cfg.proxy_bypass);
+    document.getElementById("cfg_proxy_bypass").value = proxyBypass.join("\n");
 
-    // Proxy Config Loading
-    document.getElementById("cfg_proxy_http").value = cfg.proxy_http || "";
-    document.getElementById("cfg_proxy_https").value = cfg.proxy_https || "";
-    document.getElementById("cfg_proxy_user").value = cfg.proxy_user || "";
-    document.getElementById("cfg_proxy_pass").value = cfg.proxy_pass || "";
-    document.getElementById("cfg_proxy_bypass").value = (cfg.proxy_bypass || []).join("\n");
+    const cacheTokenCount = document.getElementById("cfg_enable_token_cache");
+    cacheTokenCount.checked = normalizeFlagValue(cfg.enable_token_cache);
 
-	const autoToken = document.getElementById("cfg_auto_refresh_token");
-	autoToken.checked = cfg.auto_refresh_token || false;
-	updateSwitchLabel(autoToken, "自动刷新Token");
-
-    const outputTokenCount = document.getElementById("cfg_output_token_count");
-    outputTokenCount.checked = cfg.output_token_count || false;
-    updateSwitchLabel(outputTokenCount, "输出Token计数");
-
-    const cacheTokenCount = document.getElementById("cfg_cache_token_count");
-    cacheTokenCount.checked = cfg.cache_token_count || false;
-    updateSwitchLabel(cacheTokenCount, "缓存Token计数");
-    document.getElementById("cfg_cache_ttl").value = cfg.cache_ttl || 5;
-    const cacheStrategy = (cfg.cache_strategy || "split").toLowerCase();
-    document.getElementById("cfg_cache_strategy").value = cacheStrategy === "mixed" ? "mix" : cacheStrategy;
+    syncTokenCacheTTLControls(cfg.token_cache_ttl || 300);
+    document.getElementById("cfg_token_cache_strategy").value = cfg.token_cache_strategy || "1";
 
   } catch (err) {
     showToast("加载配置失败", "error");
@@ -90,35 +146,28 @@ async function loadConfiguration() {
 
 // Save configuration to API
 async function saveConfiguration() {
+  const proxyBypassRaw = document.getElementById("cfg_proxy_bypass").value;
   const data = {
-    admin_pass: document.getElementById("cfg_admin_pass").value,
+    admin_password: document.getElementById("cfg_admin_pass").value,
     admin_token: document.getElementById("cfg_admin_token").value,
-    max_retries: parseInt(document.getElementById("cfg_max_retries").value),
-    retry_delay: parseInt(document.getElementById("cfg_retry_delay").value),
-    account_switch_count: parseInt(document.getElementById("cfg_switch_count").value),
-	request_timeout: parseInt(document.getElementById("cfg_request_timeout").value),
-	token_refresh_interval: parseInt(document.getElementById("cfg_refresh_interval").value),
-	auto_refresh_token: document.getElementById("cfg_auto_refresh_token").checked,
-	output_token_count: document.getElementById("cfg_output_token_count").checked,
-    cache_token_count: document.getElementById("cfg_cache_token_count").checked,
-    cache_ttl: parseInt(document.getElementById("cfg_cache_ttl").value),
-    cache_strategy: document.getElementById("cfg_cache_strategy").value,
-
-    // Proxy Config Saving
-    proxy_http: document.getElementById("cfg_proxy_http").value,
-    proxy_https: document.getElementById("cfg_proxy_https").value,
-    proxy_user: document.getElementById("cfg_proxy_user").value,
-    proxy_pass: document.getElementById("cfg_proxy_pass").value,
-    proxy_bypass: document.getElementById("cfg_proxy_bypass").value.split("\n").filter(line => line.trim() !== "")
+    proxy_url: document.getElementById("cfg_proxy_url").value.trim(),
+    proxy_bypass: parseProxyBypass(proxyBypassRaw),
+    enable_token_cache: document.getElementById("cfg_enable_token_cache").checked ? "true" : "false",
+    token_cache_ttl: getTokenCacheTTLValue(),
+    token_cache_strategy: document.getElementById("cfg_token_cache_strategy").value,
   };
 
   try {
-    const res = await fetch("/api/config", {
+    const res = await fetch("/api/config/save", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(data)
     });
     if (!res.ok) throw new Error(await res.text());
+    const payload = await res.json();
+    if (payload.code !== 0) {
+      throw new Error(payload.message || payload.msg || "保存失败");
+    }
     showToast("配置保存成功");
   } catch (err) {
     showToast("保存失败: " + err.message, "error");
@@ -146,11 +195,20 @@ function renderApiKeys() {
   if (apiKeys.length === 0) {
     container.innerHTML = "";
     const empty = document.createElement("div");
-    empty.className = "empty-state";
+    empty.className = "empty-state empty-state-panel";
+    const mark = document.createElement("span");
+    mark.className = "empty-state-mark";
+    mark.textContent = "KY";
     const p = document.createElement("p");
     p.textContent = "暂无 API Key，点击上方按钮创建";
+    empty.appendChild(mark);
     empty.appendChild(p);
     container.appendChild(empty);
+    return;
+  }
+
+  if (window.matchMedia("(max-width: 640px)").matches) {
+    renderApiKeysMobile(container);
     return;
   }
 
@@ -291,6 +349,80 @@ function renderApiKeys() {
     if (!actionEl || !container.contains(actionEl)) return;
     const action = actionEl.dataset.action;
     if (action === "delete-key") {
+      const id = decodeData(actionEl.dataset.id || "");
+      const label = actionEl.dataset.label ? decodeURIComponent(actionEl.dataset.label) : "";
+      if (id) openDeleteKeyModal(id, label);
+    }
+  };
+
+  container.onchange = (e) => {
+    const target = e.target;
+    if (!(target instanceof HTMLInputElement)) return;
+    if (target.dataset.action !== "toggle-key") return;
+    const id = decodeData(target.dataset.id || "");
+    if (!id) return;
+    toggleKeyStatus(id, target.checked);
+  };
+}
+
+function renderApiKeysMobile(container) {
+  const cards = apiKeys.map((k, idx) => {
+    const keyDisplay = k.key_full || `${k.key_prefix}****${k.key_suffix}`;
+    const encodedKey = encodeURIComponent(keyDisplay);
+    const encodedLabel = encodeURIComponent(`${k.key_prefix}...${k.key_suffix}`);
+    const lastUsed = k.last_used_at ? formatTime(k.last_used_at) : "从未使用";
+    return `
+      <article class="config-key-card">
+        <div class="config-key-head">
+          <div class="config-key-token">
+            <button type="button" class="key-toggle" data-idx="${idx}">👁️</button>
+            <span id="key-display-${idx}" class="key-display" data-key="${encodedKey}">${escapeHtml(`${k.key_prefix || ""}****...${k.key_suffix || ""}`)}</span>
+          </div>
+          <label class="toggle">
+            <input type="checkbox" data-action="toggle-key" data-id="${encodeData(k.id)}" ${k.enabled ? "checked" : ""}>
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+        <div class="config-key-meta">
+          <div class="config-key-item">
+            <span class="config-key-label">最后使用</span>
+            <span>${escapeHtml(lastUsed)}</span>
+          </div>
+        </div>
+        <div class="config-key-actions">
+          <button type="button" class="btn btn-danger-outline" data-action="delete-key" data-id="${encodeData(k.id)}" data-label="${encodedLabel}">删除</button>
+        </div>
+      </article>
+    `;
+  }).join("");
+
+  container.innerHTML = `<div class="config-key-list">${cards}</div>`;
+
+  const tip = document.createElement("div");
+  tip.className = "config-key-tip";
+  tip.innerHTML = `
+    <div class="config-key-tip-title">提示</div>
+    <div class="config-key-tip-body">• API Key 用于访问接口的身份认证<br>• 禁用的 Key 将无法访问 API<br>• 请妥善保管您的 API Key，不要泄露给他人</div>
+  `;
+  container.appendChild(tip);
+
+  container.onclick = (e) => {
+    const display = e.target.closest(".key-display");
+    if (display && container.contains(display)) {
+      const encoded = display.dataset.key || "";
+      const value = encoded ? decodeURIComponent(encoded) : (display.textContent || "");
+      copyToClipboard(value);
+      return;
+    }
+    const toggle = e.target.closest(".key-toggle");
+    if (toggle && container.contains(toggle)) {
+      const idx = parseInt(toggle.dataset.idx, 10);
+      if (!Number.isNaN(idx)) toggleKeyVisibility(idx);
+      return;
+    }
+    const actionEl = e.target.closest("[data-action]");
+    if (!actionEl || !container.contains(actionEl)) return;
+    if (actionEl.dataset.action === "delete-key") {
       const id = decodeData(actionEl.dataset.id || "");
       const label = actionEl.dataset.label ? decodeURIComponent(actionEl.dataset.label) : "";
       if (id) openDeleteKeyModal(id, label);
@@ -475,27 +607,43 @@ function decodeData(value) {
   }
 }
 
-// Toggle cache config details
+function formatBytes(bytes) {
+  const n = Number(bytes) || 0;
+  if (n >= 1024 * 1024) {
+    return (n / (1024 * 1024)).toFixed(2) + " MB";
+  }
+  if (n >= 1024) {
+    return (n / 1024).toFixed(2) + " KB";
+  }
+  return n + " B";
+}
+
 function toggleCacheConfig(checked) {
   const details = document.getElementById("cacheConfigDetails");
-  if (details) {
-    details.style.display = checked ? "block" : "none";
-    if (checked) {
-       loadCacheStats();
-    }
+  if (!details) return;
+  details.style.display = checked ? "block" : "none";
+  if (checked) {
+    updateMemoryEstimation();
+    loadCacheStats();
   }
 }
 
-// Update memory estimation
 function updateMemoryEstimation() {
-  const ttlMin = parseInt(document.getElementById("cfg_cache_ttl").value) || 5;
-  const strategy = document.getElementById("cfg_cache_strategy").value;
-  const mult = strategy === "split" ? 2 : 1;
-  const ttlSec = ttlMin * 60;
+  const strategyInput = document.getElementById("cfg_token_cache_strategy");
+  if (!strategyInput) return;
 
-  document.getElementById("estTTLSeconds").textContent = ttlSec;
-  document.getElementById("estStrategyMult").textContent = mult === 2 ? "× 2" : "× 1";
-  document.getElementById("memoryEstTitle").textContent = `内存估算 (当前: TTL=${ttlMin}分钟, ${strategy === "split" ? "分离缓存×2" : "混合缓存×1"})`;
+  const ttlSec = parseInt(getTokenCacheTTLValue(), 10) || 300;
+  const strategy = strategyInput.value;
+  const mult = (strategy === "1" || strategy === "0") ? 2 : 1;
+
+  const ttlEl = document.getElementById("estTTLSeconds");
+  const multEl = document.getElementById("estStrategyMult");
+  const titleEl = document.getElementById("memoryEstTitle");
+  if (ttlEl) ttlEl.textContent = String(ttlSec);
+  if (multEl) multEl.textContent = mult === 2 ? "× 2" : "× 1";
+  if (titleEl) {
+    titleEl.textContent = `内存估算 (当前: TTL=${ttlSec}秒, 系数=${mult})`;
+  }
 
   const calc = (qps) => {
     const kb = qps * ttlSec * 0.5 * mult;
@@ -503,40 +651,47 @@ function updateMemoryEstimation() {
     return kb.toFixed(1) + "KB";
   };
 
-  document.getElementById("estLow").textContent = calc(10);
-  document.getElementById("estMid").textContent = calc(50);
-  document.getElementById("estHigh").textContent = calc(100);
+  const lowEl = document.getElementById("estLow");
+  const midEl = document.getElementById("estMid");
+  const highEl = document.getElementById("estHigh");
+  if (lowEl) lowEl.textContent = calc(10);
+  if (midEl) midEl.textContent = calc(50);
+  if (highEl) highEl.textContent = calc(100);
 }
 
-// Load cache stats
 async function loadCacheStats() {
+  const statsEl = document.getElementById("cacheStatsText");
+  if (!statsEl) return;
+
   try {
-    const res = await fetch("/api/config/cache/stats");
-    if (!res.ok) return;
+    const res = await fetch("/api/token-cache/stats");
+    if (!res.ok) {
+      throw new Error(await res.text());
+    }
     const data = await res.json();
 
-    if (data.status === "disabled") {
-      document.getElementById("cacheStatsText").textContent = "缓存未启用";
+    if (data.code !== 0 || !data.data.connected) {
+      statsEl.textContent = "缓存未启用";
       return;
     }
 
-    const sizeStr = data.size_bytes > 1024 * 1024
-      ? (data.size_bytes / (1024 * 1024)).toFixed(2) + " MB"
-      : (data.size_bytes / 1024).toFixed(2) + " KB";
-
-    document.getElementById("cacheStatsText").textContent = `缓存条目: ${data.count} 条，占用内存: ${sizeStr}`; // Note: size is approximate
+    statsEl.textContent = `缓存条目: ${Number(data.data.key_count) || 0} 条，占用内存: ${data.data.memory_used_str || "0 B"}`;
   } catch (err) {
-    console.error("Failed to load cache stats", err);
+    statsEl.textContent = "缓存统计加载失败";
   }
 }
 
-// Clear cache
 async function clearCache() {
-  if (!confirm("确定要清空所有缓存吗？")) return;
+  if (!confirm("确定要清空 Token 用量缓存吗？")) return;
   try {
-    const res = await fetch("/api/config/cache/clear", { method: "POST" });
+    const res = await fetch("/api/token-cache/clear", { method: "POST" });
     if (!res.ok) throw new Error(await res.text());
-    showToast("缓存已清空");
+    const data = await res.json();
+    if (data.code !== 0) {
+      throw new Error(data.message || data.msg || "清空失败");
+    }
+    const deleted = Number(data?.data?.deleted) || 0;
+    showToast(`已清空 ${deleted} 条缓存`);
     loadCacheStats();
   } catch (err) {
     showToast("清空失败: " + err.message, "error");
@@ -546,14 +701,12 @@ async function clearCache() {
 // Load configuration on page load
 document.addEventListener('DOMContentLoaded', () => {
   loadConfiguration().then(() => {
-    // Initialize UI states after config load
-    const cacheEnabled = document.getElementById("cfg_cache_token_count").checked;
+    const cacheEnabled = !!document.getElementById("cfg_enable_token_cache")?.checked;
     toggleCacheConfig(cacheEnabled);
     updateMemoryEstimation();
     if (cacheEnabled) {
       loadCacheStats();
     }
-    // Load API keys as they are now part of the basic configuration tab
     loadApiKeys();
   });
 });

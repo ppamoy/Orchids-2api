@@ -4,40 +4,60 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 var ErrNoRows = fmt.Errorf("no rows in result set")
 
 type Account struct {
-	ID            int64     `json:"id"`
-	Name          string    `json:"name"`
-	AccountType   string    `json:"account_type"`
-	SessionID     string    `json:"session_id"`
-	ClientCookie  string    `json:"client_cookie"`
-	RefreshToken  string    `json:"refresh_token,omitempty"`
-	SessionCookie string    `json:"session_cookie"`
-	ClientUat     string    `json:"client_uat"`
-	ProjectID     string    `json:"project_id"`
-	UserID        string    `json:"user_id"`
-	AgentMode     string    `json:"agent_mode"`
-	Email         string    `json:"email"`
-	Weight        int       `json:"weight"`
-	Enabled       bool      `json:"enabled"`
-	Token         string    `json:"token"`        // Truncated display token
-	Subscription  string    `json:"subscription"` // "free", "pro", etc.
-	UsageCurrent  float64   `json:"usage_current"`
-	UsageTotal    float64   `json:"usage_total"` // Used as lifetime usage
-	UsageDaily    float64   `json:"usage_daily"` // Usage for current day
-	UsageLimit    float64   `json:"usage_limit"` // Daily limit
-	ResetDate     string    `json:"reset_date"`  // YYYY-MM-DD for daily reset
-	StatusCode    string    `json:"status_code"`
-	LastAttempt   time.Time `json:"last_attempt"`
-	QuotaResetAt  time.Time `json:"quota_reset_at"`
-	RequestCount  int64     `json:"request_count"`
-	LastUsedAt    time.Time `json:"last_used_at"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	ID                   int64     `json:"id"`
+	Name                 string    `json:"name"`
+	AccountType          string    `json:"account_type"`
+	NSFWEnabled          bool      `json:"nsfw_enabled"`
+	SessionID            string    `json:"session_id"`
+	ClientCookie         string    `json:"client_cookie"`
+	RefreshToken         string    `json:"refresh_token,omitempty"`
+	DeviceID             string    `json:"device_id,omitempty"`
+	RequestID            string    `json:"request_id,omitempty"`
+	SessionCookie        string    `json:"session_cookie"`
+	ClientUat            string    `json:"client_uat"`
+	ProjectID            string    `json:"project_id"`
+	UserID               string    `json:"user_id"`
+	AgentMode            string    `json:"agent_mode"`
+	Email                string    `json:"email"`
+	Weight               int       `json:"weight"`
+	Enabled              bool      `json:"enabled"`
+	Token                string    `json:"token"`        // Truncated display token
+	Subscription         string    `json:"subscription"` // "free", "pro", etc.
+	UsageCurrent         float64   `json:"usage_current"`
+	UsageTotal           float64   `json:"usage_total"` // Used as lifetime usage
+	UsageLimit           float64   `json:"usage_limit"` // Daily limit
+	WarpMonthlyLimit     float64   `json:"warp_monthly_limit,omitempty"`
+	WarpMonthlyRemaining float64   `json:"warp_monthly_remaining,omitempty"`
+	WarpBonusRemaining   float64   `json:"warp_bonus_remaining,omitempty"`
+	StatusCode           string    `json:"status_code"`
+	LastAttempt          time.Time `json:"last_attempt"`
+	QuotaResetAt         time.Time `json:"quota_reset_at"`
+	RequestCount         int64     `json:"request_count"`
+	LastUsedAt           time.Time `json:"last_used_at"`
+	CreatedAt            time.Time `json:"created_at"`
+	UpdatedAt            time.Time `json:"updated_at"`
+}
+
+// SyncState compares this account against a snapshot and returns true if key session/auth fields differ.
+func (a *Account) SyncState(snapshot *Account) bool {
+	if a == nil || snapshot == nil {
+		return false
+	}
+	return a.SessionID != snapshot.SessionID ||
+		a.ClientUat != snapshot.ClientUat ||
+		a.ProjectID != snapshot.ProjectID ||
+		a.UserID != snapshot.UserID ||
+		a.Email != snapshot.Email ||
+		a.ClientCookie != snapshot.ClientCookie
 }
 
 type Settings struct {
@@ -50,7 +70,7 @@ type ApiKey struct {
 	ID         int64      `json:"id"`
 	Name       string     `json:"name"`
 	KeyHash    string     `json:"-"`
-	KeyFull    string     `json:"key_full,omitempty"`
+	KeyFull    string     `json:"-"`
 	KeyPrefix  string     `json:"key_prefix"`
 	KeySuffix  string     `json:"key_suffix"`
 	Enabled    bool       `json:"enabled"`
@@ -106,6 +126,12 @@ type modelStore interface {
 	DeleteModel(ctx context.Context, id string) error
 	GetModel(ctx context.Context, id string) (*Model, error)
 	ListModels(ctx context.Context) ([]*Model, error)
+	GetModelByModelID(ctx context.Context, modelID string) (*Model, error)
+	GetModelByChannelAndModelID(ctx context.Context, channel, modelID string) (*Model, error)
+}
+
+type redisClientStore interface {
+	Client() *redis.Client
 }
 
 type closeableStore interface {
@@ -125,7 +151,21 @@ func New(opts Options) (*Store, error) {
 	if err := store.seedModels(); err != nil {
 		slog.Warn("failed to seed models in redis", "error", err)
 	}
+	if err := store.cleanupDeprecatedData(); err != nil {
+		slog.Warn("failed to cleanup deprecated data", "error", err)
+	}
 	return store, nil
+}
+
+func (s *Store) cleanupDeprecatedData() error {
+	ctx := context.Background()
+	if err := s.cleanupDeprecatedAccounts(ctx); err != nil {
+		return err
+	}
+	if err := s.cleanupDeprecatedModels(ctx); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (s *Store) seedModels() error {
@@ -134,12 +174,14 @@ func (s *Store) seedModels() error {
 	models := []Model{
 		// Orchids 模型
 		{ID: "6", Channel: "Orchids", ModelID: "claude-sonnet-4-5", Name: "Claude Sonnet 4.5", Status: ModelStatusAvailable, IsDefault: true, SortOrder: 0},
-		{ID: "7", Channel: "Orchids", ModelID: "claude-opus-4-5", Name: "Claude Opus 4.5", Status: ModelStatusAvailable, IsDefault: false, SortOrder: 1},
-		{ID: "42", Channel: "Orchids", ModelID: "claude-sonnet-4-5-thinking", Name: "Claude Sonnet 4.5 Thinking", Status: ModelStatusAvailable, IsDefault: false, SortOrder: 2},
-		{ID: "43", Channel: "Orchids", ModelID: "claude-opus-4-5-thinking", Name: "Claude Opus 4.5 Thinking", Status: ModelStatusAvailable, IsDefault: false, SortOrder: 3},
-		{ID: "8", Channel: "Orchids", ModelID: "claude-haiku-4-5", Name: "Claude Haiku 4.5", Status: ModelStatusAvailable, IsDefault: false, SortOrder: 4},
-		{ID: "9", Channel: "Orchids", ModelID: "claude-sonnet-4-20250514", Name: "Claude Sonnet 4", Status: ModelStatusAvailable, IsDefault: false, SortOrder: 5},
-		{ID: "10", Channel: "Orchids", ModelID: "claude-3-7-sonnet-20250219", Name: "Claude 3.7 Sonnet", Status: ModelStatusAvailable, IsDefault: false, SortOrder: 6},
+		{ID: "44", Channel: "Orchids", ModelID: "claude-opus-4-6", Name: "Claude Opus 4.6", Status: ModelStatusAvailable, IsDefault: false, SortOrder: 1},
+		{ID: "45", Channel: "Orchids", ModelID: "claude-opus-4-6-thinking", Name: "Claude Opus 4.6 Thinking", Status: ModelStatusAvailable, IsDefault: false, SortOrder: 2},
+		{ID: "7", Channel: "Orchids", ModelID: "claude-opus-4-5", Name: "Claude Opus 4.5", Status: ModelStatusAvailable, IsDefault: false, SortOrder: 3},
+		{ID: "42", Channel: "Orchids", ModelID: "claude-sonnet-4-5-thinking", Name: "Claude Sonnet 4.5 Thinking", Status: ModelStatusAvailable, IsDefault: false, SortOrder: 4},
+		{ID: "43", Channel: "Orchids", ModelID: "claude-opus-4-5-thinking", Name: "Claude Opus 4.5 Thinking", Status: ModelStatusAvailable, IsDefault: false, SortOrder: 5},
+		{ID: "8", Channel: "Orchids", ModelID: "claude-haiku-4-5", Name: "Claude Haiku 4.5", Status: ModelStatusAvailable, IsDefault: false, SortOrder: 6},
+		{ID: "9", Channel: "Orchids", ModelID: "claude-sonnet-4-20250514", Name: "Claude Sonnet 4", Status: ModelStatusAvailable, IsDefault: false, SortOrder: 7},
+		{ID: "10", Channel: "Orchids", ModelID: "claude-3-7-sonnet-20250219", Name: "Claude 3.7 Sonnet", Status: ModelStatusAvailable, IsDefault: false, SortOrder: 8},
 		// Warp 模型
 		{ID: "60", Channel: "Warp", ModelID: "auto", Name: "Warp Auto", Status: ModelStatusAvailable, IsDefault: true, SortOrder: 0},
 		{ID: "61", Channel: "Warp", ModelID: "auto-efficient", Name: "Warp Auto Efficient", Status: ModelStatusAvailable, IsDefault: false, SortOrder: 1},
@@ -164,20 +206,125 @@ func (s *Store) seedModels() error {
 		{ID: "85", Channel: "Warp", ModelID: "gpt-5-1-codex-high", Name: "GPT-5.1 Codex High (Warp)", Status: ModelStatusAvailable, IsDefault: false, SortOrder: 20},
 		{ID: "86", Channel: "Warp", ModelID: "gpt-5-1-codex-max-low", Name: "GPT-5.1 Codex Max Low (Warp)", Status: ModelStatusAvailable, IsDefault: false, SortOrder: 21},
 		{ID: "70", Channel: "Warp", ModelID: "warp-basic", Name: "Warp Basic", Status: ModelStatusAvailable, IsDefault: false, SortOrder: 22},
+		{ID: "87", Channel: "Warp", ModelID: "claude-4-6-sonnet-high", Name: "Claude 4.6 Sonnet High (Warp)", Status: ModelStatusAvailable, IsDefault: false, SortOrder: 23},
+		{ID: "88", Channel: "Warp", ModelID: "claude-4-6-sonnet-max", Name: "Claude 4.6 Sonnet Max (Warp)", Status: ModelStatusAvailable, IsDefault: false, SortOrder: 24},
+		// Puter 模型
+		// 这里采用“无前缀主模型”策略：
+		// 参考 puter2api 仓库附带的 model.json，只收录不带 provider 前缀的主模型，
+		// 不直接暴露 openrouter:/togetherai: 这类聚合源模型，避免列表膨胀过大。
 	}
 
+	models = append(models, buildGrokSeedModels()...)
+	models = append(models, buildBoltBootstrapModels()...)
+	models = append(models, buildPuterSeedModels()...)
+
 	for _, m := range models {
-		_, err := s.GetModelByModelID(ctx, m.ModelID)
-		if err != nil {
-			// Model doesn't exist, create it
-			if err := s.CreateModel(ctx, &m); err != nil {
-				slog.Warn("Failed to seed model", "model_id", m.ModelID, "error", err)
-			} else {
-				slog.Info("Seeded model", "model_id", m.ModelID)
-			}
+		if _, err := s.GetModelByChannelAndModelID(ctx, m.Channel, m.ModelID); err == nil {
+			continue
+		}
+		if err := s.CreateModel(ctx, &m); err != nil {
+			slog.Warn("Failed to seed model", "model_id", m.ModelID, "error", err)
+		} else {
+			slog.Debug("Seeded model", "model_id", m.ModelID)
 		}
 	}
+
+	deprecatedModelIDs := []string{
+		"grok-3",
+		"grok-3-thinking",
+		"grok-3-fast",
+		"grok-4",
+		"grok-4-mini",
+		"grok-4-fast",
+		"grok-4-heavy",
+		"grok-4.1-mini",
+		"grok-4.1-fast",
+		"grok-4.1-thinking",
+		"grok-4.1",
+		"grok-4-1-thinking-1129",
+		"grok-4.2",
+		"grok-4.20-beta",
+		"grok-4.20-0309-reasoning",
+		"grok-4.20-0309-non-reasoning",
+		"grok-code-fast",
+		"grok-code-fast-1",
+		"grok-2",
+		"grok-2.1",
+		"grok-3.1",
+		"grok-4.21",
+		"grok-5",
+	}
+	for _, modelID := range deprecatedModelIDs {
+		m, err := s.GetModelByModelID(ctx, modelID)
+		if err != nil || m == nil {
+			continue
+		}
+		if err := s.DeleteModel(ctx, m.ID); err != nil {
+			slog.Warn("Failed to remove deprecated model", "model_id", modelID, "error", err)
+			continue
+		}
+		slog.Debug("Removed deprecated model", "model_id", modelID)
+	}
+
 	return nil
+}
+
+func (s *Store) cleanupDeprecatedAccounts(ctx context.Context) error {
+	accounts, err := s.ListAccounts(ctx)
+	if err != nil {
+		return err
+	}
+	for _, acc := range accounts {
+		if acc == nil || !isDeprecatedChannelName(acc.AccountType) {
+			continue
+		}
+		if err := s.DeleteAccount(ctx, acc.ID); err != nil {
+			slog.Warn("Failed to remove deprecated account", "account_id", acc.ID, "account_type", acc.AccountType, "error", err)
+			continue
+		}
+		slog.Debug("Removed deprecated account", "account_id", acc.ID, "account_type", acc.AccountType)
+	}
+	return nil
+}
+
+func (s *Store) cleanupDeprecatedModels(ctx context.Context) error {
+	models, err := s.ListModels(ctx)
+	if err != nil {
+		return err
+	}
+	for _, model := range models {
+		if model == nil || !isDeprecatedChannelName(model.Channel) {
+			continue
+		}
+		if err := s.DeleteModel(ctx, model.ID); err != nil {
+			slog.Warn("Failed to remove deprecated model channel", "model_id", model.ModelID, "channel", model.Channel, "error", err)
+			continue
+		}
+		slog.Debug("Removed deprecated model channel", "model_id", model.ModelID, "channel", model.Channel)
+	}
+	return nil
+}
+
+func isDeprecatedChannelName(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "v0", "v0-web":
+		return true
+	default:
+		return false
+	}
+}
+
+func buildGrokSeedModels() []Model {
+	return []Model{
+		{ID: "107", Channel: "Grok", ModelID: "grok-420", Name: "Grok 420", Status: ModelStatusAvailable, IsDefault: true, SortOrder: 0},
+		{ID: "91", Channel: "Grok", ModelID: "grok-3-mini", Name: "Grok 3 Mini", Status: ModelStatusAvailable, IsDefault: false, SortOrder: 1},
+		{ID: "96", Channel: "Grok", ModelID: "grok-4-thinking", Name: "Grok 4 Thinking", Status: ModelStatusAvailable, IsDefault: false, SortOrder: 2},
+		{ID: "101", Channel: "Grok", ModelID: "grok-4.1-expert", Name: "Grok 4.1 Expert", Status: ModelStatusAvailable, IsDefault: false, SortOrder: 3},
+		{ID: "108", Channel: "Grok", ModelID: "grok-imagine-1.0", Name: "Grok Imagine 1.0", Status: ModelStatusAvailable, IsDefault: false, SortOrder: 4},
+		{ID: "109", Channel: "Grok", ModelID: "grok-imagine-1.0-fast", Name: "Grok Imagine 1.0 Fast", Status: ModelStatusAvailable, IsDefault: false, SortOrder: 5},
+		{ID: "110", Channel: "Grok", ModelID: "grok-imagine-1.0-edit", Name: "Grok Imagine 1.0 Edit", Status: ModelStatusAvailable, IsDefault: false, SortOrder: 6},
+		{ID: "111", Channel: "Grok", ModelID: "grok-imagine-1.0-video", Name: "Grok Imagine 1.0 Video", Status: ModelStatusAvailable, IsDefault: false, SortOrder: 7},
+	}
 }
 
 func (s *Store) Close() error {
@@ -187,6 +334,26 @@ func (s *Store) Close() error {
 		}
 	}
 	return nil
+}
+
+// RedisClient returns the underlying Redis client, or nil if not using Redis.
+func (s *Store) RedisClient() *redis.Client {
+	if s.accounts != nil {
+		if rs, ok := s.accounts.(redisClientStore); ok {
+			return rs.Client()
+		}
+	}
+	return nil
+}
+
+// RedisPrefix returns the configured key prefix.
+func (s *Store) RedisPrefix() string {
+	if s.accounts != nil {
+		if rs, ok := s.accounts.(*redisStore); ok {
+			return rs.prefix
+		}
+	}
+	return "orchids:"
 }
 
 func (s *Store) CreateAccount(ctx context.Context, acc *Account) error {
@@ -304,7 +471,9 @@ func (s *Store) CreateModel(ctx context.Context, m *Model) error {
 				for _, other := range models {
 					if other.Channel == m.Channel && other.IsDefault {
 						other.IsDefault = false
-						s.models.UpdateModel(ctx, other)
+						if err := s.models.UpdateModel(ctx, other); err != nil {
+							slog.Warn("Failed to clear default flag on model", "model_id", other.ModelID, "error", err)
+						}
 					}
 				}
 			}
@@ -322,7 +491,9 @@ func (s *Store) UpdateModel(ctx context.Context, m *Model) error {
 				for _, other := range models {
 					if other.Channel == m.Channel && other.ID != m.ID && other.IsDefault {
 						other.IsDefault = false
-						s.models.UpdateModel(ctx, other)
+						if err := s.models.UpdateModel(ctx, other); err != nil {
+							slog.Warn("Failed to clear default flag on model", "model_id", other.ModelID, "error", err)
+						}
 					}
 				}
 			}
@@ -348,16 +519,14 @@ func (s *Store) GetModel(ctx context.Context, id string) (*Model, error) {
 
 func (s *Store) GetModelByModelID(ctx context.Context, modelID string) (*Model, error) {
 	if s.models != nil {
-		models, err := s.models.ListModels(ctx)
-		if err != nil {
-			return nil, err
-		}
-		for _, m := range models {
-			if m.ModelID == modelID {
-				return m, nil
-			}
-		}
-		return nil, fmt.Errorf("model not found")
+		return s.models.GetModelByModelID(ctx, modelID)
+	}
+	return nil, fmt.Errorf("models store not configured")
+}
+
+func (s *Store) GetModelByChannelAndModelID(ctx context.Context, channel, modelID string) (*Model, error) {
+	if s.models != nil {
+		return s.models.GetModelByChannelAndModelID(ctx, channel, modelID)
 	}
 	return nil, fmt.Errorf("models store not configured")
 }

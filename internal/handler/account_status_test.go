@@ -21,6 +21,11 @@ func TestClassifyAccountStatus(t *testing.T) {
 			expected: "403",
 		},
 		{
+			name:     "Model not found should not mark account",
+			errStr:   "grok upstream status=403 body={\"error\":{\"code\":7,\"message\":\"Model is not found\",\"details\":[]}}",
+			expected: "",
+		},
+		{
 			name:     "Explicit 404",
 			errStr:   "HTTP 404 Not Found",
 			expected: "404",
@@ -28,6 +33,16 @@ func TestClassifyAccountStatus(t *testing.T) {
 		{
 			name:     "Signed out message",
 			errStr:   "User is signed out",
+			expected: "401",
+		},
+		{
+			name:     "No active Clerk sessions",
+			errStr:   "no active sessions found",
+			expected: "401",
+		},
+		{
+			name:     "Missing Orchids client cookie",
+			errStr:   "signed out: missing orchids client cookie",
 			expected: "401",
 		},
 		{
@@ -39,6 +54,11 @@ func TestClassifyAccountStatus(t *testing.T) {
 			name:     "Explicit 429",
 			errStr:   "HTTP 429 Too Many Requests",
 			expected: "429",
+		},
+		{
+			name:     "Puter insufficient funds maps to cooldown",
+			errStr:   "puter API error: code=insufficient_funds, status=402, message=Available funding is insufficient for this request.",
+			expected: "402",
 		},
 		{
 			name:     "Quota exceeded message",
@@ -53,7 +73,7 @@ func TestClassifyAccountStatus(t *testing.T) {
 		{
 			name:     "Credits exhausted message",
 			errStr:   "You have run out of credits. Please upgrade your plan to continue.",
-			expected: "429",
+			expected: "402",
 		},
 		{
 			name:     "Server error (ignored)",

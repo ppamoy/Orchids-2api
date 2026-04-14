@@ -7,7 +7,6 @@ import (
 	"math/rand/v2"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"orchids-api/internal/auth"
@@ -26,7 +25,7 @@ type LoadBalancer struct {
 	cachedAccounts []*store.Account
 	cacheExpires   time.Time
 	cacheTTL       time.Duration
-	activeConns    sync.Map // map[int64]*atomic.Int64
+	connTracker    ConnTracker
 	sfGroup        singleflight.Group
 }
 
@@ -35,9 +34,15 @@ func NewWithCacheTTL(s *store.Store, cacheTTL time.Duration) *LoadBalancer {
 		cacheTTL = defaultCacheTTL
 	}
 	return &LoadBalancer{
-		Store:    s,
-		cacheTTL: cacheTTL,
+		Store:       s,
+		cacheTTL:    cacheTTL,
+		connTracker: NewMemoryConnTracker(),
 	}
+}
+
+// SetConnTracker replaces the default in-memory connection tracker.
+func (lb *LoadBalancer) SetConnTracker(ct ConnTracker) {
+	lb.connTracker = ct
 }
 
 func (lb *LoadBalancer) GetModelChannel(ctx context.Context, modelID string) string {
@@ -52,6 +57,10 @@ func (lb *LoadBalancer) GetModelChannel(ctx context.Context, modelID string) str
 }
 
 func (lb *LoadBalancer) GetNextAccountExcludingByChannel(ctx context.Context, excludeIDs []int64, channel string) (*store.Account, error) {
+	return lb.GetNextAccountExcludingByChannelWithTracker(ctx, excludeIDs, channel, nil)
+}
+
+func (lb *LoadBalancer) GetNextAccountExcludingByChannelWithTracker(ctx context.Context, excludeIDs []int64, channel string, tracker ConnTracker) (*store.Account, error) {
 	accounts, err := lb.getEnabledAccounts(ctx)
 	if err != nil {
 		return nil, err
@@ -59,15 +68,14 @@ func (lb *LoadBalancer) GetNextAccountExcludingByChannel(ctx context.Context, ex
 
 	var filtered []*store.Account
 	excludeSet := make(map[int64]bool)
+	channelMatched := 0
+	rateLimitedUnavailable := 0
 	for _, id := range excludeIDs {
 		excludeSet[id] = true
 	}
 
 	for _, acc := range accounts {
 		if excludeSet[acc.ID] {
-			continue
-		}
-		if !lb.isAccountAvailable(ctx, acc) {
 			continue
 		}
 		if channel != "" {
@@ -79,43 +87,48 @@ func (lb *LoadBalancer) GetNextAccountExcludingByChannel(ctx context.Context, ex
 				continue
 			}
 		}
+		channelMatched++
+		if !lb.isAccountAvailable(ctx, acc) {
+			if strings.TrimSpace(acc.StatusCode) == "429" {
+				rateLimitedUnavailable++
+			}
+			continue
+		}
 		filtered = append(filtered, acc)
 	}
 	accounts = filtered
 
 	if len(accounts) == 0 {
+		if channel != "" && channelMatched > 0 && rateLimitedUnavailable == channelMatched {
+			return nil, fmt.Errorf("no enabled accounts available for channel: %s (all matching accounts are rate-limited or cooling down)", channel)
+		}
 		return nil, fmt.Errorf("no enabled accounts available for channel: %s", channel)
 	}
 
-	account := lb.selectAccount(accounts)
+	account := lb.selectAccountWithTracker(accounts, tracker)
 
-	slog.Info("Selected account", "name", account.Name, "email", account.Email, "session", auth.MaskSensitive(account.SessionID))
-
-	if err := lb.Store.IncrementRequestCount(ctx, account.ID); err != nil {
-		return nil, err
-	}
+	slog.Debug("Selected account", "id", account.ID, "name", account.Name, "type", account.AccountType, "session", auth.MaskSensitive(account.SessionID))
 
 	return account, nil
-}
-
-// deepCopyAccounts 深拷贝账号切片，避免并发请求共享同一指针导致数据竞争
-func deepCopyAccounts(src []*store.Account) []*store.Account {
-	dst := make([]*store.Account, len(src))
-	for i, acc := range src {
-		copied := *acc
-		dst[i] = &copied
-	}
-	return dst
 }
 
 func (lb *LoadBalancer) getEnabledAccounts(ctx context.Context) ([]*store.Account, error) {
 	now := time.Now()
 
+	lb.mu.RLock()
+	if len(lb.cachedAccounts) > 0 && now.Before(lb.cacheExpires) {
+		accounts := lb.cachedAccounts
+		lb.mu.RUnlock()
+		return accounts, nil
+	}
+	lb.mu.RUnlock()
+
 	// Use singleflight to prevent cache stampede
 	val, err, _ := lb.sfGroup.Do("getEnabledAccounts", func() (interface{}, error) {
+		// Double check after acquiring singleflight lock
 		lb.mu.RLock()
 		if len(lb.cachedAccounts) > 0 && now.Before(lb.cacheExpires) {
-			accounts := deepCopyAccounts(lb.cachedAccounts)
+			accounts := lb.cachedAccounts
 			lb.mu.RUnlock()
 			return accounts, nil
 		}
@@ -131,7 +144,7 @@ func (lb *LoadBalancer) getEnabledAccounts(ctx context.Context) ([]*store.Accoun
 		lb.cacheExpires = time.Now().Add(lb.cacheTTL)
 		lb.mu.Unlock()
 
-		return deepCopyAccounts(accounts), nil
+		return accounts, nil
 	})
 
 	if err != nil {
@@ -141,12 +154,29 @@ func (lb *LoadBalancer) getEnabledAccounts(ctx context.Context) ([]*store.Accoun
 }
 
 func (lb *LoadBalancer) selectAccount(accounts []*store.Account) *store.Account {
+	return lb.selectAccountWithTracker(accounts, nil)
+}
+
+func (lb *LoadBalancer) selectAccountWithTracker(accounts []*store.Account, tracker ConnTracker) *store.Account {
 	if len(accounts) == 0 {
 		return nil
 	}
 	if len(accounts) == 1 {
 		return accounts[0]
 	}
+	if tracker == nil {
+		tracker = lb.connTracker
+	}
+	if tracker == nil {
+		tracker = NewMemoryConnTracker()
+	}
+
+	// Batch-fetch connection counts
+	ids := make([]int64, len(accounts))
+	for i, acc := range accounts {
+		ids[i] = acc.ID
+	}
+	connCounts := tracker.GetCounts(ids)
 
 	var bestAccounts []*store.Account
 	minScore := float64(-1)
@@ -157,10 +187,7 @@ func (lb *LoadBalancer) selectAccount(accounts []*store.Account) *store.Account 
 			weight = 1
 		}
 
-		var conns int64
-		if val, ok := lb.activeConns.Load(acc.ID); ok {
-			conns = val.(*atomic.Int64).Load()
-		}
+		conns := connCounts[acc.ID]
 		score := float64(conns) / float64(weight)
 
 		if bestAccounts == nil || score < minScore {
@@ -179,30 +206,26 @@ func (lb *LoadBalancer) selectAccount(accounts []*store.Account) *store.Account 
 }
 
 func (lb *LoadBalancer) AcquireConnection(accountID int64) {
-	val, _ := lb.activeConns.LoadOrStore(accountID, &atomic.Int64{})
-	val.(*atomic.Int64).Add(1)
+	lb.connTracker.Acquire(accountID)
 }
 
 func (lb *LoadBalancer) ReleaseConnection(accountID int64) {
-	if val, ok := lb.activeConns.Load(accountID); ok {
-		counter := val.(*atomic.Int64)
-		for {
-			current := counter.Load()
-			if current <= 0 {
-				break
-			}
-			if counter.CompareAndSwap(current, current-1) {
-				break
-			}
-		}
-	}
+	lb.connTracker.Release(accountID)
 }
 
 const (
 	// 401 冷却时间：token 可能已刷新，较短间隔后重试
 	retry401Default = 5 * time.Minute
+	// 402 对 Puter 来说通常表示余额/credits 不足，不应很快重新参与调度
+	retry402Default = 6 * time.Hour
+	// 429 冷却时间：限流通常是暂时性的，优先等待较短窗口再恢复尝试
+	retry429Default = 1 * time.Minute
+	// Bolt 的 429 在实际使用中恢复很慢，固定冷却更能避免反复撞限流账号
+	retry429Bolt = 12 * time.Hour
 	// 403/404 冷却时间：账号可能被封禁或配置错误，较长间隔后重试
 	retry403Default = 24 * time.Hour
+	// Grok 的 403 很多是 Cloudflare challenge/临时风控，不应长时间拉黑
+	retry403Grok = 10 * time.Minute
 )
 
 func (lb *LoadBalancer) isAccountAvailable(ctx context.Context, acc *store.Account) bool {
@@ -223,12 +246,54 @@ func (lb *LoadBalancer) isAccountAvailable(ctx context.Context, acc *store.Accou
 			return true
 		}
 		return false
-	case "403", "404":
-		// 403/404 可能是临时封禁或配置问题，较长冷却后自动恢复
+	case "429":
 		if acc.LastAttempt.IsZero() {
 			return false
 		}
-		if now.Sub(acc.LastAttempt) >= retry403Default {
+		cooldown := retry429Default
+		if strings.EqualFold(acc.AccountType, "bolt") {
+			cooldown = retry429Bolt
+		} else if !acc.QuotaResetAt.IsZero() {
+			if !now.Before(acc.QuotaResetAt) {
+				lb.clearAccountStatus(ctx, acc, "429 冷却完成，自动恢复尝试")
+				return true
+			}
+			return false
+		}
+		if now.Sub(acc.LastAttempt) >= cooldown {
+			lb.clearAccountStatus(ctx, acc, "429 冷却完成，自动恢复尝试")
+			return true
+		}
+		return false
+	case "402":
+		// 402 通常表示余额/credits 不足。若上游给出 reset 时间则优先尊重，
+		// 否则使用更长的冷却，避免调度器持续撞到同一个无额度账号。
+		if !acc.QuotaResetAt.IsZero() {
+			if !now.Before(acc.QuotaResetAt) {
+				lb.clearAccountStatus(ctx, acc, "402 冷却完成，自动恢复尝试")
+				return true
+			}
+			return false
+		}
+		if acc.LastAttempt.IsZero() {
+			return false
+		}
+		if now.Sub(acc.LastAttempt) >= retry402Default {
+			lb.clearAccountStatus(ctx, acc, "402 冷却完成，自动恢复尝试")
+			return true
+		}
+		return false
+	case "403", "404":
+		// 403/404 可能是临时封禁或配置问题。
+		// 对 Grok 来说，403 很多是 Cloudflare challenge，不应长时间拉黑。
+		if acc.LastAttempt.IsZero() {
+			return false
+		}
+		cooldown := retry403Default
+		if strings.EqualFold(acc.AccountType, "grok") {
+			cooldown = retry403Grok
+		}
+		if now.Sub(acc.LastAttempt) >= cooldown {
 			lb.clearAccountStatus(ctx, acc, status+" 冷却完成，自动恢复尝试")
 			return true
 		}
@@ -256,10 +321,19 @@ func (lb *LoadBalancer) clearAccountStatus(ctx context.Context, acc *store.Accou
 	if strings.EqualFold(acc.AccountType, "warp") && acc.ID > 0 {
 		warp.InvalidateSession(acc.ID)
 	}
+	// Find and update the account in the cached slice so the change reflects immediately
 	lb.mu.Lock()
 	acc.StatusCode = ""
 	acc.LastAttempt = time.Time{}
 	acc.QuotaResetAt = time.Time{}
+	for _, cached := range lb.cachedAccounts {
+		if cached.ID == acc.ID {
+			cached.StatusCode = ""
+			cached.LastAttempt = time.Time{}
+			cached.QuotaResetAt = time.Time{}
+			break
+		}
+	}
 	lb.mu.Unlock()
 	lb.persistAccountStatus(ctx, acc, reason)
 }
@@ -270,12 +344,18 @@ func (lb *LoadBalancer) MarkAccountStatus(ctx context.Context, acc *store.Accoun
 		return
 	}
 	lb.mu.Lock()
-	if acc.StatusCode == status {
-		lb.mu.Unlock()
-		return
-	}
+	now := time.Now()
 	acc.StatusCode = status
-	acc.LastAttempt = time.Now()
+	acc.LastAttempt = now
+
+	// Ensure the cache is updated as well
+	for _, cached := range lb.cachedAccounts {
+		if cached.ID == acc.ID {
+			cached.StatusCode = status
+			cached.LastAttempt = now
+			break
+		}
+	}
 	lb.mu.Unlock()
 	lb.persistAccountStatus(ctx, acc, "后台刷新失败: "+status)
 }
@@ -288,5 +368,5 @@ func (lb *LoadBalancer) persistAccountStatus(ctx context.Context, acc *store.Acc
 		slog.Warn("账号状态更新失败", "account_id", acc.ID, "reason", reason, "error", err)
 		return
 	}
-	slog.Info("账号状态已更新", "account_id", acc.ID, "status", acc.StatusCode, "reason", reason)
+	slog.Debug("账号状态已更新", "account_id", acc.ID, "status", acc.StatusCode, "reason", reason)
 }

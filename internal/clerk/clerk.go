@@ -2,11 +2,12 @@ package clerk
 
 import (
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
+	"github.com/goccy/go-json"
 	"io"
 	"net/http"
 	"net/url"
+	"orchids-api/internal/util"
 	"strings"
 	"time"
 )
@@ -56,15 +57,25 @@ type AccountInfo struct {
 	JWT          string
 }
 
-func FetchAccountInfo(clientCookie string) (*AccountInfo, error) {
-	return FetchAccountInfoWithProjectAndSession(clientCookie, "", "")
+type ParsedOrchidsCookies struct {
+	ClientCookie  string
+	SessionCookie string
+	ClientUat     string
 }
 
-func FetchAccountInfoWithSession(clientCookie string, sessionCookie string) (*AccountInfo, error) {
-	return FetchAccountInfoWithProjectAndSession(clientCookie, sessionCookie, "")
+func FetchAccountInfoWithSessionProxy(clientCookie string, sessionCookie string, proxyFunc func(*http.Request) (*url.URL, error)) (*AccountInfo, error) {
+	return FetchAccountInfoWithProjectAndSessionContextProxy(clientCookie, sessionCookie, "", "", "", proxyFunc)
 }
 
-func FetchAccountInfoWithProjectAndSession(clientCookie string, sessionCookie string, customProjectID string) (*AccountInfo, error) {
+func FetchAccountInfoWithProjectAndSessionProxy(clientCookie string, sessionCookie string, customProjectID string, proxyFunc func(*http.Request) (*url.URL, error)) (*AccountInfo, error) {
+	return FetchAccountInfoWithProjectAndSessionContextProxy(clientCookie, sessionCookie, "", "", customProjectID, proxyFunc)
+}
+
+func FetchAccountInfoWithSessionContextProxy(clientCookie string, sessionCookie string, clientUat string, sessionID string, proxyFunc func(*http.Request) (*url.URL, error)) (*AccountInfo, error) {
+	return FetchAccountInfoWithProjectAndSessionContextProxy(clientCookie, sessionCookie, clientUat, sessionID, "", proxyFunc)
+}
+
+func FetchAccountInfoWithProjectAndSessionContextProxy(clientCookie string, sessionCookie string, clientUat string, sessionID string, customProjectID string, proxyFunc func(*http.Request) (*url.URL, error)) (*AccountInfo, error) {
 	url := fmt.Sprintf("%s/v1/client?__clerk_api_version=%s&_clerk_js_version=%s", ClerkBaseURL, ClerkAPIVersion, ClerkJSVersion)
 
 	req, err := http.NewRequest("GET", url, nil)
@@ -76,12 +87,17 @@ func FetchAccountInfoWithProjectAndSession(clientCookie string, sessionCookie st
 	req.Header.Set("Accept-Language", "zh-CN")
 	req.Header.Set("Origin", "https://www.orchids.app")
 	req.Header.Set("Referer", "https://www.orchids.app/")
-	req.AddCookie(&http.Cookie{Name: "__client", Value: clientCookie})
-	if strings.TrimSpace(sessionCookie) != "" {
-		req.AddCookie(&http.Cookie{Name: "__session", Value: sessionCookie})
+	if sid, _ := ParseSessionInfoFromJWT(strings.TrimSpace(sessionCookie)); strings.TrimSpace(sessionID) == "" && sid != "" {
+		sessionID = sid
+	}
+	if cookieHeader := buildClerkCookieHeader(clientCookie, sessionCookie, clientUat, sessionID); cookieHeader != "" {
+		req.Header.Set("Cookie", cookieHeader)
 	}
 
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{
+		Timeout:   10 * time.Second,
+		Transport: util.NewBrowserLikeTransport(proxyFunc),
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch client info: %w", err)
@@ -125,12 +141,50 @@ func FetchAccountInfoWithProjectAndSession(clientCookie string, sessionCookie st
 	return &AccountInfo{
 		SessionID:    clientResp.Response.LastActiveSessionID,
 		ClientCookie: effectiveCookie,
-		ClientUat:    fmt.Sprintf("%d", time.Now().Unix()),
+		ClientUat:    firstNonEmptyClientUat(resp.Cookies(), clientUat),
 		ProjectID:    projectID,
 		UserID:       session.User.ID,
 		Email:        session.User.EmailAddresses[0].EmailAddress,
 		JWT:          session.LastActiveToken.JWT,
 	}, nil
+}
+
+func buildClerkCookieHeader(clientCookie string, sessionCookie string, clientUat string, sessionID string) string {
+	clientCookie = strings.TrimSpace(clientCookie)
+	sessionCookie = strings.TrimSpace(sessionCookie)
+	clientUat = strings.TrimSpace(clientUat)
+	sessionID = strings.TrimSpace(sessionID)
+
+	parts := make([]string, 0, 4)
+	if clientCookie != "" {
+		parts = append(parts, "__client="+clientCookie)
+	}
+	if sessionCookie != "" {
+		parts = append(parts, "__session="+sessionCookie)
+	}
+	if clientUat != "" {
+		parts = append(parts, "__client_uat="+clientUat)
+	}
+	if sessionID != "" {
+		parts = append(parts, "clerk_active_context="+sessionID+":")
+	}
+	return strings.Join(parts, "; ")
+}
+
+func firstNonEmptyClientUat(cookies []*http.Cookie, fallback string) string {
+	for _, c := range cookies {
+		if c == nil || c.Name != "__client_uat" {
+			continue
+		}
+		if value := strings.TrimSpace(c.Value); value != "" {
+			return value
+		}
+	}
+	fallback = strings.TrimSpace(fallback)
+	if fallback != "" {
+		return fallback
+	}
+	return fmt.Sprintf("%d", time.Now().Unix())
 }
 
 func ParseClientCookies(input string) (clientJWT string, sessionJWT string, err error) {
@@ -171,6 +225,102 @@ func ParseClientCookies(input string) (clientJWT string, sessionJWT string, err 
 	}
 
 	return "", "", fmt.Errorf("unsupported client cookie format")
+}
+
+func ParseOrchidsCookies(input string) (ParsedOrchidsCookies, bool, error) {
+	trimmed := strings.TrimSpace(input)
+	if trimmed == "" {
+		return ParsedOrchidsCookies{}, false, nil
+	}
+
+	if strings.HasPrefix(trimmed, "[") {
+		var cookies []struct {
+			Name  string `json:"name"`
+			Value string `json:"value"`
+		}
+		if err := json.Unmarshal([]byte(trimmed), &cookies); err != nil {
+			return ParsedOrchidsCookies{}, false, err
+		}
+		parsed := collectOrchidsCookies(func(yield func(string, string)) {
+			for _, cookie := range cookies {
+				yield(cookie.Name, cookie.Value)
+			}
+		})
+		return parsed, parsed.hasAny(), nil
+	}
+
+	if strings.Contains(trimmed, "=") {
+		parts := strings.FieldsFunc(trimmed, func(r rune) bool {
+			return r == ';' || r == '\n'
+		})
+		parsed := collectOrchidsCookies(func(yield func(string, string)) {
+			for _, part := range parts {
+				part = strings.TrimSpace(part)
+				if part == "" {
+					continue
+				}
+				kv := strings.SplitN(part, "=", 2)
+				if len(kv) != 2 {
+					continue
+				}
+				yield(strings.TrimSpace(kv[0]), strings.TrimSpace(kv[1]))
+			}
+		})
+		return parsed, parsed.hasAny(), nil
+	}
+
+	return ParsedOrchidsCookies{}, false, nil
+}
+
+func (p ParsedOrchidsCookies) hasAny() bool {
+	return strings.TrimSpace(p.ClientCookie) != "" || strings.TrimSpace(p.SessionCookie) != "" || strings.TrimSpace(p.ClientUat) != ""
+}
+
+func collectOrchidsCookies(iter func(func(string, string))) ParsedOrchidsCookies {
+	var parsed ParsedOrchidsCookies
+	var exactClient bool
+	var exactSession bool
+	var exactClientUat bool
+
+	iter(func(name, value string) {
+		name = strings.TrimSpace(name)
+		value = normalizeCookieTokenValue(value)
+		if name == "" || value == "" {
+			return
+		}
+
+		switch {
+		case name == "__client":
+			parsed.ClientCookie = value
+			exactClient = true
+		case isNamespacedClientCookie(name) && !exactClient && parsed.ClientCookie == "":
+			parsed.ClientCookie = value
+		case name == "__session":
+			parsed.SessionCookie = value
+			exactSession = true
+		case isNamespacedSessionCookie(name) && !exactSession && parsed.SessionCookie == "":
+			parsed.SessionCookie = value
+		case name == "__client_uat":
+			parsed.ClientUat = value
+			exactClientUat = true
+		case isNamespacedClientUatCookie(name) && !exactClientUat && parsed.ClientUat == "":
+			parsed.ClientUat = value
+		}
+	})
+
+	return parsed
+}
+
+func isNamespacedClientCookie(name string) bool {
+	return name != "__client_uat" && strings.HasPrefix(name, "__client_") && !isNamespacedClientUatCookie(name)
+}
+
+func isNamespacedSessionCookie(name string) bool {
+	return strings.HasPrefix(name, "__session_")
+}
+
+func isNamespacedClientUatCookie(name string) bool {
+	return strings.HasPrefix(name, "__client_uat_")
 }
 
 func extractCookieValue(input string, name string) (string, error) {

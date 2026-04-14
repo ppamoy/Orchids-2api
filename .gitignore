@@ -7,6 +7,9 @@ debug-logs
 *.dylib
 orchids-api
 orchids-server
+server
+!cmd/server/
+!cmd/server/*.go
 
 # Test binary
 *.test
@@ -20,10 +23,15 @@ go.work.sum
 
 # Dependency directories
 vendor/
+node_modules/
 
 # IDE
 .idea/
 .vscode/
+.agent/
+.claude/
+.omc/
+internal/grok/.omc/
 *.swp
 *.swo
 *~
@@ -45,10 +53,12 @@ Thumbs.db
 # Logs
 *.log
 logs/
+internal/grok/data/
 
 # Build
 build/
 dist/
+tmp_aiclient/
 
 # Test
 test/

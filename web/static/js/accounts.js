@@ -5,11 +5,132 @@ let currentPlatform = '';
 let accountHealth = {};
 let pageSize = 20;
 let currentPage = 1;
+let modelCatalog = [];
+
+// DOM 缓存
+const domCache = {
+    accountsList: null,
+    paginationInfo: null,
+    paginationControls: null,
+    accountImportStatus: null,
+};
+
+function initDOMCache() {
+    domCache.accountsList = document.getElementById("accountsList");
+    domCache.paginationInfo = document.getElementById("paginationInfo");
+    domCache.paginationControls = document.getElementById("paginationControls");
+    domCache.accountImportStatus = document.getElementById("accountImportStatus");
+}
+
+const fallbackAgentModes = {
+  orchids: [
+    "claude-sonnet-4-5",
+    "claude-opus-4-6",
+    "claude-opus-4-6-thinking",
+    "claude-opus-4-5",
+    "claude-sonnet-4-5-thinking",
+  ],
+  warp: [
+    "auto",
+    "auto-efficient",
+    "auto-genius",
+    "claude-4-5-sonnet",
+    "claude-4-5-sonnet-thinking",
+    "claude-4-5-opus",
+    "claude-4-5-opus-thinking",
+    "claude-4-6-opus-high",
+    "claude-4-6-opus-max",
+  ],
+  bolt: [
+    "claude-opus-4-6",
+    "claude-sonnet-4-5",
+    "claude-3-7-sonnet-20250219",
+  ],
+  puter: [
+    "claude-opus-4-5",
+    "claude-sonnet-4-5",
+    "claude-3-7-sonnet-20250219",
+  ],
+  grok: [
+    "grok-3",
+    "grok-3-mini",
+    "grok-3-thinking",
+    "grok-4",
+    "grok-4-mini",
+    "grok-4-thinking",
+    "grok-4-heavy",
+    "grok-4.1-mini",
+    "grok-4.1-fast",
+    "grok-4.1-expert",
+    "grok-4.1-thinking",
+    "grok-imagine-1.0",
+    "grok-imagine-1.0-edit",
+    "grok-imagine-1.0-video",
+  ],
+};
+
+function normalizeChannel(channel) {
+  return String(channel || "orchids").trim().toLowerCase();
+}
+
+function isModelAvailable(model) {
+  if (!model) return false;
+  if (typeof model.status === "boolean") return model.status;
+  const status = String(model.status || "").toLowerCase();
+  if (!status) return true;
+  return status === "available";
+}
+
+function bySortOrder(a, b) {
+  const aOrderRaw = a && a.sort_order;
+  const bOrderRaw = b && b.sort_order;
+  const aOrder = Number.isFinite(Number(aOrderRaw)) ? Number(aOrderRaw) : 0;
+  const bOrder = Number.isFinite(Number(bOrderRaw)) ? Number(bOrderRaw) : 0;
+  if (aOrder !== bOrder) return aOrder - bOrder;
+  const aModelID = a && a.model_id ? a.model_id : "";
+  const bModelID = b && b.model_id ? b.model_id : "";
+  return String(aModelID).localeCompare(String(bModelID));
+}
+
+function getModelsForAccountType(type) {
+  const channel = normalizeChannel(type);
+  const active = modelCatalog
+    .filter((m) => normalizeChannel(m.channel) === channel)
+    .filter(isModelAvailable)
+    .sort(bySortOrder);
+
+  if (active.length > 0) return active;
+
+  const fallback = fallbackAgentModes[channel] || [];
+  return fallback.map((modelID, idx) => ({
+    model_id: modelID,
+    name: modelID,
+    sort_order: idx,
+    is_default: idx === 0,
+  }));
+}
+
+async function loadModelCatalog() {
+  try {
+    const res = await fetch("/api/models");
+    if (!res.ok) {
+      throw new Error(`status ${res.status}`);
+    }
+    const list = await res.json();
+    modelCatalog = Array.isArray(list) ? list : [];
+  } catch (err) {
+    console.error("Failed to load models:", err);
+    modelCatalog = [];
+  }
+}
 
 // Load accounts from API
 async function loadAccounts() {
   try {
-    const res = await fetch("/api/accounts");
+    const [res] = await Promise.all([
+      fetch("/api/accounts"),
+      loadModelCatalog(),
+    ]);
     if (res.status === 401) {
       window.location.href = "./login.html";
       return;
@@ -36,36 +157,346 @@ function normalizeAccountType(acc) {
   return (acc.account_type || 'orchids').toLowerCase();
 }
 
+function getQuotaStats(acc) {
+  if (!acc) return null;
+  const type = normalizeAccountType(acc);
+  if (type === "puter") {
+    return { supported: false, unknown: true };
+  }
+  if (type === "warp") {
+    const monthlyLimit = Math.max(0, Math.floor(acc.warp_monthly_limit || acc.usage_limit || 0));
+    const monthlyRemainingRaw = acc.warp_monthly_remaining !== undefined && acc.warp_monthly_remaining !== null
+      ? acc.warp_monthly_remaining
+      : (monthlyLimit > 0 ? monthlyLimit - Math.floor(acc.usage_current || 0) : 0);
+    const monthlyRemaining = Math.max(0, Math.floor(monthlyRemainingRaw || 0));
+    const bonusRemaining = Math.max(0, Math.floor(acc.warp_bonus_remaining || 0));
+    const remaining = monthlyRemaining + bonusRemaining;
+    if (monthlyLimit > 0 || bonusRemaining > 0) {
+      const displayTotal = monthlyLimit + bonusRemaining;
+      const pctRemaining = displayTotal > 0 ? Math.min(100, Math.round((remaining / displayTotal) * 100)) : 0;
+      return {
+        supported: true,
+        limit: monthlyLimit,
+        remaining,
+        used: Math.max(0, Math.floor(acc.usage_current || 0)),
+        pctRemaining,
+        monthlyLimit,
+        monthlyRemaining,
+        bonusRemaining,
+        splitBonus: bonusRemaining > 0,
+      };
+    }
+  }
+  const explicitLimit = Math.floor(acc.quota_limit || 0);
+  const hasExplicitRemaining = acc.quota_remaining !== undefined && acc.quota_remaining !== null;
+  if (explicitLimit > 0 && hasExplicitRemaining) {
+    const remaining = Math.max(0, Math.floor(acc.quota_remaining || 0));
+    const used = Math.max(0, explicitLimit - remaining);
+    const pctRemaining = explicitLimit > 0 ? Math.min(100, Math.round((remaining / explicitLimit) * 100)) : 0;
+    return { supported: true, limit: explicitLimit, remaining, used, pctRemaining };
+  }
+
+  const limit = Math.floor(acc.usage_limit || 0);
+  if (limit <= 0) return null;
+  const current = Math.floor(acc.usage_current || 0);
+  let remaining = 0;
+  if (type === "warp") {
+    remaining = Math.max(0, limit - current);
+  } else {
+    remaining = Math.max(0, current);
+  }
+  const used = Math.max(0, limit - remaining);
+  const pctRemaining = limit > 0 ? Math.min(100, Math.round((remaining / limit) * 100)) : 0;
+  return { supported: true, limit, remaining, used, pctRemaining };
+}
+
 function getAccountToken(acc) {
   if (!acc) return '';
   const type = normalizeAccountType(acc);
   if (type === 'warp') {
-    return acc.refresh_token || acc.client_cookie || '';
+    return acc.refresh_token || acc.token || acc.client_cookie || '';
   }
-  return acc.client_cookie || '';
+  if (type === 'orchids') {
+    return acc.client_cookie || acc.session_cookie || acc.token || '';
+  }
+  if (type === 'bolt') {
+    return acc.session_cookie || acc.client_cookie || acc.token || '';
+  }
+  if (type === 'puter') {
+    return acc.client_cookie || acc.token || acc.session_cookie || '';
+  }
+  return acc.client_cookie || acc.token || '';
 }
 
 function applyTokenLabels(type) {
   const label = document.getElementById("tokenLabel");
   const input = document.getElementById("clientCookie");
   const hint = document.getElementById("tokenHint");
+  const projectGroup = document.getElementById("projectIdGroup");
+  const projectInput = document.getElementById("projectId");
+  const accountId = String(document.getElementById("accountId")?.value || "");
   if (!label || !input || !hint) return;
+  if (projectGroup && projectInput) {
+    const boltMode = type === "bolt";
+    projectGroup.style.display = boltMode ? "" : "none";
+    projectInput.required = boltMode;
+  }
   if (type === 'warp') {
     label.textContent = "Refresh Token";
-    input.placeholder = "粘贴 refresh_token";
-    hint.textContent = "Warp 只需要 refresh_token";
-  } else {
-    label.textContent = "Client Cookie / JWT";
-    input.placeholder = "粘贴 Clerk Cookie 或 JWT";
-    hint.textContent = "支持完整 Cookie（含 __session）或纯 JWT；运行时自动获取";
+    input.placeholder = "每行一个 refresh_token";
+    hint.textContent = accountId
+      ? "编辑时仅保存第一行 refresh_token"
+      : "支持批量添加 Warp。每行一个 refresh_token";
+    input.required = true;
+  } else if (type === 'grok') {
+    label.textContent = "SSO Token";
+    input.placeholder = "每行一个 sso token（或包含 sso= 的 Cookie）";
+    hint.textContent = accountId
+      ? "编辑时仅保存第一行 SSO Token"
+      : "支持批量添加 Grok。每行一个 sso token 或 Cookie 片段";
+  } else if (type === 'bolt') {
+    label.textContent = "__session";
+    input.placeholder = "每行一个 Bolt __session";
+    hint.textContent = accountId
+      ? "Bolt 编辑时仅保存第一行 __session，并保留当前 project_id"
+      : "支持批量添加 Bolt。每行一个 __session，project_id 共用下方输入";
+    input.required = true;
+    } else if (type === 'puter') {
+      label.textContent = "Auth Token";
+      input.placeholder = "每行一个 Puter auth_token";
+      hint.textContent = accountId
+        ? "Puter 编辑时仅保存第一行 auth_token。可前往 https://docs.puter.com/playground/ai-chatgpt/ 获取"
+        : "支持批量添加 Puter。每行一个 auth_token；可前往 https://docs.puter.com/playground/ai-chatgpt/ 获取";
+      input.required = true;
+    } else {
+    label.textContent = "Cookie / __client / __session";
+    input.placeholder = "支持原始 __client、完整 Cookie Header 或 Cookie JSON";
+    hint.textContent = accountId
+      ? "支持直接粘贴 clerk.orchids.app 的原始 __client；完整 Cookie 成功率更高，只有 www.orchids.app 的 __session 通常不够"
+      : "支持原始 __client、完整 Cookie Header 或 Cookie JSON；推荐同时带上 __client_uat 以提高补全成功率";
+    input.required = true;
   }
+}
+
+function splitBatchCredentialInput(raw) {
+  const text = String(raw || "").trim();
+  if (!text) return [];
+  if (/^[\[{]/.test(text)) {
+    return [text];
+  }
+  const lines = text
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(Boolean);
+  if (lines.length > 1) {
+    return lines;
+  }
+  return [text];
+}
+
+function normalizeCredentialForType(type, credential) {
+  const normalizedType = String(type || "").trim().toLowerCase();
+  const raw = String(credential || "").trim();
+  if (!raw) return "";
+
+  if (normalizedType === "warp") {
+    const match = raw.match(/(?:^|[?&;\s])refresh_token=([^&;\s]+)/);
+    return (match ? match[1] : raw).trim();
+  }
+
+  if (normalizedType === "grok") {
+    const ssoMatch = raw.match(/(?:^|[;\s])sso=([^;\s]+)/i);
+    return (ssoMatch ? ssoMatch[1] : raw).trim();
+  }
+
+  return raw;
+}
+
+function buildCredentialFingerprint(type, credential) {
+  const normalizedType = String(type || "").trim().toLowerCase();
+  const normalizedCredential = normalizeCredentialForType(normalizedType, credential);
+  if (!normalizedType || !normalizedCredential) return "";
+  return `${normalizedType}:${normalizedCredential}`;
+}
+
+function collectExistingCredentialFingerprints(type, excludeId = "") {
+  const normalizedType = String(type || "").trim().toLowerCase();
+  const excluded = String(excludeId || "").trim();
+  const seen = new Set();
+  (Array.isArray(accounts) ? accounts : []).forEach((acc) => {
+    if (!acc) return;
+    if (String(acc.id || "") === excluded) return;
+    if (normalizeAccountType(acc) !== normalizedType) return;
+    const token = getAccountToken(acc);
+    const key = buildCredentialFingerprint(normalizedType, token);
+    if (key) seen.add(key);
+  });
+  return seen;
+}
+
+function dedupeCredentialInputs(type, credentials) {
+  const unique = [];
+  const duplicates = [];
+  const seen = new Set();
+
+  (Array.isArray(credentials) ? credentials : []).forEach((credential) => {
+    const trimmed = String(credential || "").trim();
+    if (!trimmed) return;
+    const key = buildCredentialFingerprint(type, trimmed) || `raw:${trimmed}`;
+    if (seen.has(key)) {
+      duplicates.push(trimmed);
+      return;
+    }
+    seen.add(key);
+    unique.push(trimmed);
+  });
+
+  return { unique, duplicates };
+}
+
+function filterExistingCredentialConflicts(type, credentials, excludeId = "") {
+  const existing = collectExistingCredentialFingerprints(type, excludeId);
+  const accepted = [];
+  const conflicts = [];
+
+  (Array.isArray(credentials) ? credentials : []).forEach((credential) => {
+    const trimmed = String(credential || "").trim();
+    if (!trimmed) return;
+    const key = buildCredentialFingerprint(type, trimmed);
+    if (key && existing.has(key)) {
+      conflicts.push(trimmed);
+      return;
+    }
+    accepted.push(trimmed);
+  });
+
+  return { accepted, conflicts };
+}
+
+function getAccountImportStatusNode() {
+  return domCache.accountImportStatus || document.getElementById("accountImportStatus");
+}
+
+function escapeImportStatusText(text) {
+  return String(text || "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
+function clearAccountImportStatus() {
+  const node = getAccountImportStatusNode();
+  if (!node) return;
+  node.hidden = true;
+  node.classList.remove("is-active", "is-error");
+  node.innerHTML = "";
+}
+
+function renderAccountImportStatus(message, type = "info", details = []) {
+  const node = getAccountImportStatusNode();
+  if (!node) return;
+
+  const safeMessage = escapeImportStatusText(message);
+  const rows = Array.isArray(details) ? details.filter(Boolean).slice(0, 8) : [];
+  const detailHTML = rows.length > 0
+    ? `<div style="margin-top:8px">${rows.map((item) => `<div><code>${escapeImportStatusText(item)}</code></div>`).join("")}</div>`
+    : "";
+
+  node.hidden = false;
+  node.classList.toggle("is-active", type === "info");
+  node.classList.toggle("is-error", type === "error");
+  node.innerHTML = `<strong>${safeMessage}</strong>${detailHTML}`;
+}
+
+function buildAccountPayload(type, baseData, credential, projectId) {
+  const payload = { ...baseData };
+  if (type === "warp") {
+    payload.refresh_token = credential;
+  } else if (type === "bolt") {
+    payload.session_cookie = credential;
+    payload.project_id = projectId;
+  } else {
+    payload.client_cookie = credential;
+  }
+  return payload;
+}
+
+async function createAccount(payload) {
+  const res = await fetch("/api/accounts", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Account-Sync": "async",
+    },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    throw new Error(await res.text());
+  }
+  return res.json();
+}
+
+function summarizeAccountCreateError(err) {
+  const message = String(err && err.message ? err.message : err || "").trim();
+  if (!message) return "未知错误";
+  const compact = message.replace(/\s+/g, " ");
+  return compact.length > 160 ? `${compact.slice(0, 157)}...` : compact;
+}
+
+async function runAccountCreatePool(payloads, concurrency = 6, onProgress = null) {
+  let nextIndex = 0;
+  let success = 0;
+  let failed = 0;
+  let completed = 0;
+  const failures = [];
+  const size = Math.max(1, Math.min(concurrency, payloads.length || 1));
+
+  async function worker() {
+    while (nextIndex < payloads.length) {
+      const currentIndex = nextIndex;
+      nextIndex += 1;
+      const payload = payloads[currentIndex];
+      try {
+        await createAccount(payload);
+        success += 1;
+      } catch (err) {
+        failed += 1;
+        failures.push(`#${currentIndex + 1} ${summarizeAccountCreateError(err)}`);
+        console.error("Failed to create account:", err);
+      } finally {
+        completed += 1;
+        if (typeof onProgress === "function") {
+          onProgress({
+            total: payloads.length,
+            completed,
+            success,
+            failed,
+            currentIndex,
+            payload,
+            failures,
+          });
+        }
+      }
+    }
+  }
+
+  await Promise.all(Array.from({ length: size }, () => worker()));
+  return { success, failed, failures };
+}
+
+function resolveAgentMode(type, preferredValue = "") {
+  const preferred = String(preferredValue || "").trim();
+  if (preferred) return preferred;
+  const models = getModelsForAccountType(type);
+  const defaultModel = models.find((m) => m.is_default) || models[0];
+  return defaultModel ? String(defaultModel.model_id || "").trim() : "";
 }
 
 // Render platform filter tabs
 function renderPlatformTabs() {
   const container = document.getElementById("platformFilters");
   if (!container) return;
-  const defaultTypes = ["orchids", "warp"];
+  const defaultTypes = ["orchids", "warp", "bolt", "puter", "grok"];
   const types = new Set([...defaultTypes, ...accounts.map(normalizeAccountType)]);
   const sorted = Array.from(types).sort();
   const tabs = [...sorted];
@@ -99,61 +530,105 @@ function updateAccountHealth(id, ok, msg = '') {
   };
 }
 
-// Get status badge for account
-function statusBadge(acc) {
+function normalizeStatusCode(statusCode) {
+  if (statusCode === null || statusCode === undefined) return '';
+  return String(statusCode).trim();
+}
+
+function evaluateAccountStatus(acc) {
   const health = accountHealth[acc.id];
   if (health && !health.ok) {
-    return { text: '异常', color: '#fb7185', bg: 'rgba(251, 113, 133, 0.16)', tip: health.msg || '检测失败' };
+    return { normal: false, text: '异常', color: '#fb7185', bg: 'rgba(251, 113, 133, 0.16)', tip: health.msg || '状态同步失败' };
   }
   if (!acc.enabled) {
-    return { text: '禁用', color: '#fb7185', bg: 'rgba(251, 113, 133, 0.16)', tip: '账号已禁用' };
+    return { normal: false, text: '禁用', color: '#fb7185', bg: 'rgba(251, 113, 133, 0.16)', tip: '账号已禁用' };
   }
-  // Check backend status_code
-  if (acc.status_code) {
-    switch (acc.status_code) {
+  const statusCode = normalizeStatusCode(acc.status_code);
+  if (statusCode) {
+    switch (statusCode) {
       case '429':
-        return { text: '限流', color: '#f59e0b', bg: 'rgba(245, 158, 11, 0.16)', tip: '请求过于频繁 (429)' };
+        return { normal: false, text: '限流', color: '#f59e0b', bg: 'rgba(245, 158, 11, 0.16)', tip: '请求过于频繁 (429)' };
       case '401':
-        return { text: '未授权', color: '#fb7185', bg: 'rgba(251, 113, 133, 0.16)', tip: '认证失败 (401)' };
+        return { normal: false, text: '未授权', color: '#fb7185', bg: 'rgba(251, 113, 133, 0.16)', tip: '认证失败 (401)' };
       case '403':
-        return { text: '禁止访问', color: '#fb7185', bg: 'rgba(251, 113, 133, 0.16)', tip: '访问被拒绝 (403)' };
+        return { normal: false, text: '禁止访问', color: '#fb7185', bg: 'rgba(251, 113, 133, 0.16)', tip: '访问被拒绝 (403)' };
       case '404':
-        return { text: '不存在', color: '#fb7185', bg: 'rgba(251, 113, 133, 0.16)', tip: '资源不存在 (404)' };
+        return { normal: false, text: '不存在', color: '#fb7185', bg: 'rgba(251, 113, 133, 0.16)', tip: '资源不存在 (404)' };
       default:
-        return { text: '异常', color: '#fb7185', bg: 'rgba(251, 113, 133, 0.16)', tip: '状态异常: ' + acc.status_code };
+        return { normal: false, text: '异常', color: '#fb7185', bg: 'rgba(251, 113, 133, 0.16)', tip: '状态异常: ' + statusCode };
     }
   }
+
   const type = normalizeAccountType(acc);
   if (type === 'warp') {
     if (!getAccountToken(acc)) {
-      return { text: '待补全', color: '#f59e0b', bg: 'rgba(245, 158, 11, 0.16)', tip: '缺少 Refresh Token' };
+      return { normal: false, text: '待补全', color: '#f59e0b', bg: 'rgba(245, 158, 11, 0.16)', tip: '缺少 Refresh Token' };
+    }
+  } else if (type === 'grok') {
+    if (!getAccountToken(acc)) {
+      return { normal: false, text: '待补全', color: '#f59e0b', bg: 'rgba(245, 158, 11, 0.16)', tip: '缺少 SSO Token' };
+    }
+  } else if (type === 'bolt') {
+    if (!getAccountToken(acc) || !acc.project_id) {
+      return { normal: false, text: '待补全', color: '#f59e0b', bg: 'rgba(245, 158, 11, 0.16)', tip: '缺少 Bolt __session 或 project_id' };
+    }
+  } else if (type === 'puter') {
+    if (!getAccountToken(acc)) {
+      return { normal: false, text: '待补全', color: '#f59e0b', bg: 'rgba(245, 158, 11, 0.16)', tip: '缺少 Puter auth_token' };
     }
   } else if (!acc.session_id && !acc.session_cookie) {
-    return { text: '待补全', color: '#f59e0b', bg: 'rgba(245, 158, 11, 0.16)', tip: '缺少会话信息' };
+    return { normal: false, text: '待补全', color: '#f59e0b', bg: 'rgba(245, 158, 11, 0.16)', tip: '缺少会话信息' };
   }
-  if (type === 'warp' && acc.usage_limit > 0) {
-    const used = acc.usage_current || 0;
-    if (used >= acc.usage_limit) {
-      return { text: '配额已满', color: '#fb7185', bg: 'rgba(251, 113, 133, 0.16)', tip: '配额已用尽 (已用 ' + Math.floor(used) + ' / ' + Math.floor(acc.usage_limit) + ')' };
-    }
+
+  const quota = getQuotaStats(acc);
+  if (quota && quota.limit > 0 && quota.remaining <= 0) {
+    return { normal: false, text: '配额已满', color: '#fb7185', bg: 'rgba(251, 113, 133, 0.16)', tip: '配额已用尽 (剩余 0 / ' + quota.limit.toLocaleString() + ')' };
   }
-  return { text: '正常', color: '#34d399', bg: 'rgba(52, 211, 153, 0.16)', tip: '状态正常' };
+
+  return { normal: true, text: '正常', color: '#34d399', bg: 'rgba(52, 211, 153, 0.16)', tip: '状态正常' };
 }
 
-// Check single account
-async function checkAccount(id, silent = false) {
+function isAccountAbnormal(acc) {
+  return !evaluateAccountStatus(acc).normal;
+}
+
+function matchesCurrentPlatform(acc) {
+  if (!currentPlatform) return true;
+  const key = String(currentPlatform || "").toLowerCase();
+  return normalizeAccountType(acc).includes(key);
+}
+
+// Get status badge for account
+function statusBadge(acc) {
+  return evaluateAccountStatus(acc);
+}
+
+// Refresh single account via the shared check endpoint.
+async function checkAccount(id, silent = false, actionText = "刷新") {
+  const action = "check";
   try {
-    const res = await fetch(`/api/accounts/${id}/refresh`);
+    const res = await fetch(`/api/accounts/${id}/${action}`);
     if (!res.ok) {
       throw new Error(await res.text());
     }
     const updated = await res.json();
     accounts = accounts.map(a => (a.id === id ? updated : a));
     updateAccountHealth(id, true);
-    if (!silent) showToast(`账号 ${updated.name || updated.email || id} 正常`, "success");
+    if (!silent) showToast(`账号 ${updated.name || updated.email || id} ${actionText}完成`, "success");
   } catch (err) {
-    updateAccountHealth(id, false, err.message || String(err));
-    if (!silent) showToast(`账号 ${id} 检测失败`, "error");
+    try {
+      const latestRes = await fetch(`/api/accounts/${id}`);
+      if (latestRes.ok) {
+        const latest = await latestRes.json();
+        accounts = accounts.map(a => (a.id === id ? latest : a));
+        delete accountHealth[id];
+      } else {
+        updateAccountHealth(id, false, err.message || String(err));
+      }
+    } catch (_) {
+      updateAccountHealth(id, false, err.message || String(err));
+    }
+    if (!silent) showToast(`账号 ${id} ${actionText}失败`, "error");
   } finally {
     renderAccounts();
     updateStats();
@@ -182,17 +657,18 @@ async function deleteAllAccounts() {
 
 // Clear abnormal accounts
 async function clearAbnormalAccounts() {
-  const abnormal = accounts.filter(a => !a.enabled || a.status_code || (accountHealth[a.id] && !accountHealth[a.id].ok));
+  const abnormal = accounts.filter((acc) => matchesCurrentPlatform(acc) && isAccountAbnormal(acc));
   if (abnormal.length === 0) {
-    showToast("没有异常账号", "info");
+    showToast(currentPlatform ? `当前 ${currentPlatform} 页面没有异常账号` : "没有异常账号", "info");
     return;
   }
-  if (confirm(`确定要清空 ${abnormal.length} 个异常账号吗？`)) {
+  const scopeText = currentPlatform ? `当前 ${currentPlatform} 页面中的 ` : "";
+  if (confirm(`确定要清空 ${scopeText}${abnormal.length} 个异常账号吗？`)) {
     for (const acc of abnormal) {
       await fetch(`/api/accounts/${acc.id}`, { method: "DELETE" });
     }
     loadAccounts();
-    showToast("已清空异常账号");
+    showToast(`已清空${scopeText}异常账号`);
   }
 }
 
@@ -209,14 +685,87 @@ async function batchDeleteAccounts() {
   }
 }
 
+function getSelectedAccountIDs() {
+  return Array.from(document.querySelectorAll(".row-checkbox:checked"))
+    .map((cb) => parseDataId(cb.dataset.id || ""))
+    .map((id) => Number(id))
+    .filter((id) => Number.isFinite(id) && id > 0);
+}
+
+// Enable NSFW for selected Grok accounts, or all Grok accounts when nothing selected.
+async function enableNSFW() {
+  const selectedIDs = getSelectedAccountIDs();
+  const selectedGrokIDs = selectedIDs.filter((id) => {
+    const acc = accounts.find((item) => item.id === id);
+    return !!acc && normalizeAccountType(acc) === "grok";
+  });
+
+  const payload = { concurrency: 5 };
+  let targetText = "全部 Grok 账号";
+
+  if (selectedIDs.length > 0) {
+    if (selectedGrokIDs.length === 0) {
+      showToast("选中的账号中没有 Grok 账号", "info");
+      return;
+    }
+    payload.account_ids = selectedGrokIDs;
+    targetText = `选中的 ${selectedGrokIDs.length} 个 Grok 账号`;
+    if (!confirm(`确认对${targetText}启用 NSFW 吗？`)) return;
+  } else if (!confirm("未选中账号，将对全部 Grok 账号启用 NSFW，是否继续？")) {
+    return;
+  }
+
+  try {
+    showToast(`正在为${targetText}启用 NSFW...`, "info");
+    const res = await fetch("/api/v1/admin/tokens/nsfw/enable", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    if (res.status === 401) {
+      window.location.href = "./login.html";
+      return;
+    }
+    if (!res.ok) {
+      throw new Error(await res.text());
+    }
+
+    const out = await res.json();
+    const summary = out && out.summary ? out.summary : {};
+    const total = Number(summary.total || 0);
+    const ok = Number(summary.ok || 0);
+    const fail = Number(summary.fail || Math.max(0, total - ok));
+
+    if (ok > 0) {
+      await loadAccounts();
+    }
+
+    if (fail > 0) {
+      const failedList = Object.entries(out && out.results ? out.results : {})
+        .filter(([, item]) => !item || item.success !== true)
+        .slice(0, 3)
+        .map(([token, item]) => {
+          const msg = item && item.error ? item.error : `HTTP ${item && item.http_status ? item.http_status : 0}`;
+          return `${token}: ${msg}`;
+        });
+      if (failedList.length > 0) {
+        console.warn("NSFW enable failures:", failedList.join(" | "));
+      }
+      showToast(`NSFW 启用完成：成功 ${ok}，失败 ${fail}`, "error");
+      return;
+    }
+
+    showToast(`NSFW 启用成功：共 ${ok}/${total}`, "success");
+  } catch (err) {
+    showToast(`NSFW 启用失败: ${err.message || err}`, "error");
+  }
+}
+
 // Render accounts table
 function renderAccounts() {
-  const container = document.getElementById("accountsList");
-  const filtered = accounts.filter(acc => {
-    if (!currentPlatform) return true;
-    const key = currentPlatform.toLowerCase();
-    return normalizeAccountType(acc).includes(key);
-  });
+  const container = domCache.accountsList || document.getElementById("accountsList");
+  const filtered = accounts.filter(matchesCurrentPlatform);
 
   const total = filtered.length;
   const totalPages = Math.ceil(total / pageSize) || 1;
@@ -230,24 +779,23 @@ function renderAccounts() {
   if (pageItems.length === 0) {
     container.innerHTML = "";
     const empty = document.createElement("div");
-    empty.className = "empty-state";
-    empty.style.display = "flex";
-    empty.style.flexDirection = "column";
-    empty.style.alignItems = "center";
-    empty.style.justifyContent = "center";
-    empty.style.height = "300px";
-    empty.style.color = "#94a3b8";
+    empty.className = "empty-state empty-state-panel";
     const icon = document.createElement("span");
-    icon.style.fontSize = "3rem";
-    icon.style.marginBottom = "16px";
+    icon.className = "empty-state-mark";
     icon.textContent = "📂";
     const text = document.createElement("p");
     text.textContent = `暂无 ${currentPlatform ? currentPlatform : ''} 账号数据`;
     empty.appendChild(icon);
     empty.appendChild(text);
     container.appendChild(empty);
-    document.getElementById("paginationInfo").textContent = `共 0 条记录，第 1/1 页`;
+    const paginationInfo = domCache.paginationInfo || document.getElementById("paginationInfo");
+    paginationInfo.textContent = `共 0 条记录，第 1/1 页`;
     renderPagination(1, 1);
+    return;
+  }
+
+  if (window.matchMedia("(max-width: 640px)").matches) {
+    renderAccountsMobile(container, pageItems, total, totalPages);
     return;
   }
 
@@ -263,7 +811,6 @@ function renderAccounts() {
     { label: "ID", style: "width: 60px;" },
     { label: "Token" },
     { label: "模型" },
-    { label: "今日用量", style: "width: 100px;" },
     { label: "配额", style: "width: 140px;" },
     { label: "状态" },
     { label: "调用" },
@@ -288,6 +835,9 @@ function renderAccounts() {
   table.appendChild(thead);
 
   const tbody = document.createElement("tbody");
+  
+  // 使用 DocumentFragment 批量构建表格行
+  const fragment = document.createDocumentFragment();
   pageItems.forEach((acc) => {
     const badge = statusBadge(acc);
     const tokenDisplay = formatTokenDisplay(acc);
@@ -326,22 +876,20 @@ function renderAccounts() {
     tdModel.appendChild(modelSpan);
     tr.appendChild(tdModel);
 
-    const tdUsage = document.createElement("td");
-    const usageCurrent = acc.usage_daily || 0;
-    tdUsage.style.fontSize = "0.9rem";
-    tdUsage.style.color = "#94a3b8";
-    tdUsage.textContent = usageCurrent.toFixed(2);
-    tr.appendChild(tdUsage);
-
     const tdQuota = document.createElement("td");
     tdQuota.style.fontSize = "0.85rem";
-    const type = normalizeAccountType(acc);
-    if (type === 'warp' && acc.usage_limit > 0) {
-      const used = Math.floor(acc.usage_current || 0);
-      const limit = Math.floor(acc.usage_limit);
-      const pct = limit > 0 ? Math.min(100, Math.round((used / limit) * 100)) : 0;
-      const color = pct >= 90 ? "#fb7185" : pct >= 70 ? "#f59e0b" : "#34d399";
-      tdQuota.innerHTML = `<span style="color:${color}">${used.toLocaleString()} / ${limit.toLocaleString()}</span> <span style="color:#64748b;font-size:0.75rem">(${pct}%)</span>`;
+    const quota = getQuotaStats(acc);
+    if (quota && quota.unknown) {
+      tdQuota.style.color = "#64748b";
+      tdQuota.innerHTML = `<span>未知</span> <span style="color:#64748b;font-size:0.75rem">(Puter 暂无稳定额度接口)</span>`;
+    } else if (quota) {
+      const pct = quota.pctRemaining;
+      const color = pct <= 10 ? "#fb7185" : pct <= 30 ? "#f59e0b" : "#34d399";
+      if (normalizeAccountType(acc) === "warp" && quota.splitBonus) {
+        tdQuota.innerHTML = `<span style="color:${color}">${quota.remaining.toLocaleString()}</span> <span style="color:#64748b;font-size:0.75rem">(剩余)</span><div style="color:#64748b;font-size:0.75rem">${quota.monthlyRemaining.toLocaleString()} 月度 + ${quota.bonusRemaining.toLocaleString()} 赠送</div>`;
+      } else {
+        tdQuota.innerHTML = `<span style="color:${color}">${quota.remaining.toLocaleString()} / ${quota.limit.toLocaleString()}</span> <span style="color:#64748b;font-size:0.75rem">(剩余)</span>`;
+      }
     } else {
       tdQuota.style.color = "#64748b";
       tdQuota.textContent = "-";
@@ -349,6 +897,11 @@ function renderAccounts() {
     tr.appendChild(tdQuota);
 
     const tdStatus = document.createElement("td");
+    const statusWrap = document.createElement("div");
+    statusWrap.style.display = "flex";
+    statusWrap.style.alignItems = "center";
+    statusWrap.style.gap = "6px";
+
     const statusSpan = document.createElement("span");
     statusSpan.className = "tag tag-status-normal";
     statusSpan.title = badge.tip || "";
@@ -356,7 +909,20 @@ function renderAccounts() {
     statusSpan.style.color = badge.color;
     statusSpan.style.border = "none";
     statusSpan.textContent = badge.text;
-    tdStatus.appendChild(statusSpan);
+    statusWrap.appendChild(statusSpan);
+
+    if (normalizeAccountType(acc) === "grok" && acc.nsfw_enabled === true) {
+      const nsfwSpan = document.createElement("span");
+      nsfwSpan.className = "tag";
+      nsfwSpan.title = "已开启 NSFW";
+      nsfwSpan.style.background = "rgba(239, 68, 68, 0.16)";
+      nsfwSpan.style.color = "#fda4af";
+      nsfwSpan.style.border = "none";
+      nsfwSpan.textContent = "NSFW";
+      statusWrap.appendChild(nsfwSpan);
+    }
+
+    tdStatus.appendChild(statusWrap);
     tr.appendChild(tdStatus);
 
     const tdCount = document.createElement("td");
@@ -406,13 +972,18 @@ function renderAccounts() {
     tdActions.appendChild(actionWrap);
     tr.appendChild(tdActions);
 
-    tbody.appendChild(tr);
+    // 将行添加到 fragment 而不是直接添加到 tbody
+    fragment.appendChild(tr);
   });
+  
+  // 一次性将所有行插入到 tbody
+  tbody.appendChild(fragment);
   table.appendChild(tbody);
   wrap.appendChild(table);
   container.appendChild(wrap);
 
-  document.getElementById("paginationInfo").textContent = `共 ${total} 条记录，第 ${currentPage}/${totalPages} 页`;
+  const paginationInfo = domCache.paginationInfo || document.getElementById("paginationInfo");
+  paginationInfo.textContent = `共 ${total} 条记录，第 ${currentPage}/${totalPages} 页`;
   renderPagination(currentPage, totalPages);
   updateSelectedCount();
 
@@ -441,8 +1012,110 @@ function renderAccounts() {
   };
 }
 
+function buildQuotaMarkup(acc) {
+  const quota = getQuotaStats(acc);
+  if (quota && quota.unknown) {
+    return `<span>未知</span> <span style="color:#64748b;font-size:0.75rem">(Puter 暂无稳定额度接口)</span>`;
+  }
+  if (quota) {
+    const pct = quota.pctRemaining;
+    const color = pct <= 10 ? "#fb7185" : pct <= 30 ? "#f59e0b" : "#34d399";
+    if (normalizeAccountType(acc) === "warp" && quota.splitBonus) {
+      return `<span style="color:${color}">${quota.remaining.toLocaleString()}</span> <span style="color:#64748b;font-size:0.75rem">(剩余)</span><div style="color:#64748b;font-size:0.75rem">${quota.monthlyRemaining.toLocaleString()} 月度 + ${quota.bonusRemaining.toLocaleString()} 赠送</div>`;
+    }
+    return `<span style="color:${color}">${quota.remaining.toLocaleString()} / ${quota.limit.toLocaleString()}</span> <span style="color:#64748b;font-size:0.75rem">(剩余)</span>`;
+  }
+  return `<span style="color:#64748b">-</span>`;
+}
+
+function buildStatusMarkup(acc, badge) {
+  const nsfwTag = normalizeAccountType(acc) === "grok" && acc.nsfw_enabled === true
+    ? `<span class="tag" style="background:rgba(239, 68, 68, 0.16);color:#fda4af;border:none;">NSFW</span>`
+    : "";
+  return `<span class="tag" title="${escapeHtml(badge.tip || "")}" style="background:${badge.bg};color:${badge.color};border:none;">${escapeHtml(badge.text)}</span>${nsfwTag}`;
+}
+
+function renderAccountsMobile(container, pageItems, total, totalPages) {
+  container.innerHTML = "";
+  const list = document.createElement("div");
+  list.className = "accounts-mobile-list";
+
+  const fragment = document.createDocumentFragment();
+  pageItems.forEach((acc) => {
+    const badge = statusBadge(acc);
+    const tokenDisplay = formatTokenDisplay(acc);
+    const card = document.createElement("article");
+    card.className = "account-mobile-card";
+    card.innerHTML = `
+      <div class="account-mobile-head">
+        <label class="account-mobile-check">
+          <input type="checkbox" class="row-checkbox" data-action="row-select" data-id="${encodeData(acc.id)}">
+          <span>#${escapeHtml(acc.id === null || acc.id === undefined ? "" : String(acc.id))}</span>
+        </label>
+        <div class="account-mobile-actions">
+          <button type="button" class="action-icon" data-action="edit" data-id="${encodeData(acc.id)}" title="编辑">✏️</button>
+          <button type="button" class="action-icon" data-action="refresh" data-id="${encodeData(acc.id)}" title="刷新">🔄</button>
+          <button type="button" class="action-icon" data-action="delete" data-id="${encodeData(acc.id)}" title="删除">🗑️</button>
+        </div>
+      </div>
+      <div class="account-mobile-token">
+        <span class="token-text" title="${escapeHtml(tokenDisplay)}">${escapeHtml(tokenDisplay)}</span>
+      </div>
+      <div class="account-mobile-grid">
+        <div class="account-mobile-item">
+          <span class="account-mobile-label">模型</span>
+          <span class="tag tag-free">${escapeHtml(acc.agent_mode || "auto")}</span>
+        </div>
+        <div class="account-mobile-item">
+          <span class="account-mobile-label">状态</span>
+          <div class="account-mobile-inline">${buildStatusMarkup(acc, badge)}</div>
+        </div>
+        <div class="account-mobile-item">
+          <span class="account-mobile-label">配额</span>
+          <div class="account-mobile-value">${buildQuotaMarkup(acc)}</div>
+        </div>
+        <div class="account-mobile-item">
+          <span class="account-mobile-label">调用</span>
+          <span class="account-mobile-value">${escapeHtml(String(acc.request_count || 0))}</span>
+        </div>
+        <div class="account-mobile-item">
+          <span class="account-mobile-label">最后调用</span>
+          <span class="account-mobile-value">${escapeHtml(acc.last_used_at && !acc.last_used_at.startsWith("0001") ? formatTime(acc.last_used_at) : "-")}</span>
+        </div>
+      </div>
+    `;
+    fragment.appendChild(card);
+  });
+
+  list.appendChild(fragment);
+  container.appendChild(list);
+
+  const paginationInfo = domCache.paginationInfo || document.getElementById("paginationInfo");
+  paginationInfo.textContent = `共 ${total} 条记录，第 ${currentPage}/${totalPages} 页`;
+  renderPagination(currentPage, totalPages);
+  updateSelectedCount();
+
+  container.onclick = (e) => {
+    const actionEl = e.target.closest("[data-action]");
+    if (!actionEl || !container.contains(actionEl)) return;
+    const action = actionEl.dataset.action;
+    const id = parseDataId(actionEl.dataset.id || "");
+    if (action === "edit") editAccount(id);
+    if (action === "refresh") refreshToken(id);
+    if (action === "delete") deleteAccount(id);
+  };
+
+  container.onchange = (e) => {
+    const target = e.target;
+    if (!(target instanceof HTMLInputElement)) return;
+    if (target.dataset.action === "row-select") {
+      updateSelectedCount();
+    }
+  };
+}
+
 function renderPagination(current, total) {
-  const container = document.getElementById("paginationControls");
+  const container = domCache.paginationControls || document.getElementById("paginationControls");
   if (!container) return;
 
   container.innerHTML = "";
@@ -520,32 +1193,25 @@ function updatePageSize(size) {
 // Update statistics
 function updateStats() {
   const total = accounts.length;
-  const enabled = accounts.filter((a) => a.enabled).length;
-  const abnormal = accounts.filter((a) => !a.enabled || a.status_code || (accountHealth[a.id] && !accountHealth[a.id].ok)).length;
+  const abnormal = accounts.filter(isAccountAbnormal).length;
+  const normal = Math.max(0, total - abnormal);
 
   document.getElementById("totalAccounts").textContent = total;
-  document.getElementById("enabledAccounts").textContent = enabled;
+  document.getElementById("enabledAccounts").textContent = normal;
   document.getElementById("disabledAccounts").textContent = abnormal;
 
   // Attempt to update selected if element exists (it should)
   updateSelectedCount();
-
-  const totalUsage = accounts.reduce((sum, acc) => sum + (acc.usage_daily || 0), 0);
 
   // Update sidebar footer
   const footerTotal = document.getElementById("footerTotal");
   if (footerTotal) footerTotal.textContent = total;
 
   const footerNormal = document.getElementById("footerNormal");
-  if (footerNormal) footerNormal.textContent = enabled;
+  if (footerNormal) footerNormal.textContent = normal;
 
   const footerAbnormal = document.getElementById("footerAbnormal");
   if (footerAbnormal) footerAbnormal.textContent = abnormal;
-
-  const footerUsage = document.getElementById("footerUsageText");
-  if (footerUsage) {
-    footerUsage.textContent = `${Math.floor(totalUsage)}`;
-  }
 }
 
 // Update selected count
@@ -572,27 +1238,39 @@ function openModal(account = null) {
   const modal = document.getElementById("accountModal");
   const title = document.getElementById("modalTitle");
   const form = document.getElementById("accountForm");
+  const typeEl = document.getElementById("accountType");
+  clearAccountImportStatus();
 
-  if (account) {
-    title.textContent = "编辑账号";
-    document.getElementById("accountId").value = account.id;
-    document.getElementById("accountType").value = account.account_type || "orchids";
-    document.getElementById("clientCookie").value = getAccountToken(account);
-    document.getElementById("agentMode").value = account.agent_mode || 'claude-opus-4.5';
-    document.getElementById("weight").value = account.weight || 1;
-    document.getElementById("enabled").checked = account.enabled;
-  } else {
-    title.textContent = "添加账号";
-    form.reset();
-    document.getElementById("accountId").value = "";
-    document.getElementById("agentMode").value = "claude-opus-4.5";
-    document.getElementById("weight").value = "1";
-    document.getElementById("accountType").value = "orchids";
-    document.getElementById("enabled").checked = true;
-  }
-  applyTokenLabels(document.getElementById("accountType").value);
-  modal.classList.add("active");
-  modal.style.display = "flex";
+  const finalizeModal = () => {
+    applyTokenLabels(typeEl ? typeEl.value : "orchids");
+    modal.classList.add("active");
+    modal.style.display = "flex";
+  };
+
+  const applyValues = () => {
+    if (account) {
+      title.textContent = "编辑账号";
+      document.getElementById("accountId").value = account.id;
+      document.getElementById("accountType").value = normalizeAccountType(account);
+      document.getElementById("clientCookie").value = getAccountToken(account);
+      document.getElementById("projectId").value = account.project_id || "";
+      document.getElementById("enabled").checked = account.enabled;
+    } else {
+      title.textContent = "添加账号";
+      form.reset();
+      document.getElementById("accountId").value = "";
+      document.getElementById("accountType").value = "orchids";
+      document.getElementById("enabled").checked = true;
+      document.getElementById("clientCookie").value = "";
+      document.getElementById("projectId").value = "";
+    }
+  };
+
+  loadModelCatalog()
+    .finally(() => {
+      applyValues();
+      finalizeModal();
+    });
 }
 
 // Close modal
@@ -600,6 +1278,7 @@ function closeModal() {
   const modal = document.getElementById("accountModal");
   modal.classList.remove("active");
   modal.style.display = "none";
+  clearAccountImportStatus();
 }
 
 // Save account
@@ -608,27 +1287,88 @@ async function saveAccount(e) {
   const id = document.getElementById("accountId").value;
   const type = document.getElementById("accountType").value;
   const token = document.getElementById("clientCookie").value;
+  const projectId = String(document.getElementById("projectId")?.value || "").trim();
+  const splitCredentials = splitBatchCredentialInput(token);
+  const { unique: dedupedCredentials, duplicates: duplicateInputs } = dedupeCredentialInputs(type, splitCredentials);
+  const { accepted: credentials, conflicts: existingConflicts } = filterExistingCredentialConflicts(type, dedupedCredentials, id);
+  const existing = id ? accounts.find((a) => String(a.id) === String(id)) : null;
   const data = {
     account_type: type,
-    agent_mode: document.getElementById("agentMode").value,
-    weight: parseInt(document.getElementById("weight").value) || 1,
+    agent_mode: resolveAgentMode(type, existing ? existing.agent_mode : ""),
+    weight: existing ? (parseInt(existing.weight, 10) || 1) : 1,
     enabled: document.getElementById("enabled").checked,
   };
-  if (type === 'warp') {
-    data.refresh_token = token;
-  } else {
-    data.client_cookie = token;
+
+  if (credentials.length === 0) {
+    if (duplicateInputs.length > 0 || existingConflicts.length > 0) {
+      const details = []
+        .concat(duplicateInputs.slice(0, 4).map((item) => `输入重复: ${item}`))
+        .concat(existingConflicts.slice(0, 4).map((item) => `已存在: ${item}`));
+      renderAccountImportStatus("没有可添加的新凭证，重复项已全部过滤", "error", details);
+      showToast("没有可添加的新凭证，重复项已全部过滤", "error");
+    } else {
+      showToast("请填写至少一个账号凭证", "error");
+    }
+    return;
+  }
+  if (type === "bolt" && !projectId) {
+    showToast("请填写 Bolt project_id", "error");
+    return;
   }
 
   try {
-    const url = id ? `/api/accounts/${id}` : "/api/accounts";
-    const method = id ? "PUT" : "POST";
-    const res = await fetch(url, {
-      method,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data),
-    });
-    if (!res.ok) throw new Error(await res.text());
+    clearAccountImportStatus();
+    if (duplicateInputs.length > 0 || existingConflicts.length > 0) {
+      const details = []
+        .concat(duplicateInputs.slice(0, 4).map((item) => `输入重复: ${item}`))
+        .concat(existingConflicts.slice(0, 4).map((item) => `账号已存在: ${item}`));
+      renderAccountImportStatus(
+        `已过滤重复凭证：输入重复 ${duplicateInputs.length}，库内重复 ${existingConflicts.length}`,
+        "info",
+        details,
+      );
+    }
+    if (id) {
+      const payload = buildAccountPayload(type, data, credentials[0], projectId);
+      const res = await fetch(`/api/accounts/${id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      closeModal();
+      loadAccounts();
+      showToast("保存成功");
+      return;
+    }
+
+    if (credentials.length > 1) {
+      const payloads = credentials.map((item) => buildAccountPayload(type, data, item, projectId));
+      renderAccountImportStatus(`正在批量添加账号 0/${payloads.length}`, "info");
+      const { success, failed, failures } = await runAccountCreatePool(payloads, 6, (progress) => {
+        renderAccountImportStatus(
+          `正在批量添加账号 ${progress.completed}/${progress.total}，成功 ${progress.success}，失败 ${progress.failed}`,
+          progress.failed > 0 ? "error" : "info",
+          progress.failures,
+        );
+      });
+      if (failed > 0) {
+        renderAccountImportStatus(`批量添加完成：成功 ${success}，失败 ${failed}`, "error", failures);
+      } else {
+        renderAccountImportStatus(`批量添加完成：成功 ${success}，失败 ${failed}`, "info");
+      }
+      loadAccounts();
+      if (failed === 0) {
+        closeModal();
+      }
+      showToast(
+        failed > 0 ? `批量添加完成：成功 ${success}，失败 ${failed}` : `批量添加完成：成功 ${success}`,
+        failed > 0 ? "error" : "success",
+      );
+      return;
+    }
+
+    await createAccount(buildAccountPayload(type, data, credentials[0], projectId));
     closeModal();
     loadAccounts();
     showToast("保存成功");
@@ -645,16 +1385,9 @@ function editAccount(id) {
 
 // Refresh token
 async function refreshToken(id) {
-  try {
-    showToast("正在查询账号信息...", "info");
-    const res = await fetch(`/api/accounts/${id}/refresh`);
-    if (!res.ok) throw new Error(await res.text());
-    const acc = await res.json();
-    showToast(`账号 ${acc.email || id} 刷新完成`);
-    loadAccounts();
-  } catch (err) {
-    showToast("刷新失败: " + err.message, "error");
-  }
+  const actionText = "刷新";
+  showToast(`正在${actionText}账号信息...`, "info");
+  await checkAccount(id, false, actionText);
 }
 
 // Delete account
@@ -706,14 +1439,28 @@ function formatTokenDisplay(acc) {
       if (type === 'warp') {
         // Warp tokens (JWTs) have long common prefixes, so show more of the end
         return token.substring(0, 10) + '...' + token.substring(token.length - 10);
+      } else if (type === 'grok') {
+        return token.substring(0, 8) + '...' + token.substring(token.length - 8);
       }
       return token.substring(0, 30) + '...';
     }
     return token;
   }
+  if (type === 'grok' && getAccountToken(acc)) {
+    const sso = getAccountToken(acc);
+    return sso.length > 20 ? sso.substring(0, 8) + '...' + sso.substring(sso.length - 8) : sso;
+  }
   if (type === 'warp' && getAccountToken(acc)) {
     const rt = getAccountToken(acc);
     return rt.length > 30 ? rt.substring(0, 10) + '...' + rt.substring(rt.length - 10) : rt;
+  }
+  if (type === 'bolt' && getAccountToken(acc)) {
+    const session = getAccountToken(acc);
+    return session.length > 24 ? session.substring(0, 8) + '...' + session.substring(session.length - 8) : session;
+  }
+  if (type === 'puter' && getAccountToken(acc)) {
+    const token = getAccountToken(acc);
+    return token.length > 24 ? token.substring(0, 8) + '...' + token.substring(token.length - 8) : token;
   }
   if (acc.session_id) {
     return acc.session_id.substring(0, 30) + '...';
@@ -759,10 +1506,13 @@ async function importAccounts(event) {
 
 // Load accounts on page load
 document.addEventListener('DOMContentLoaded', () => {
+  initDOMCache();
   loadAccounts();
   const typeSelect = document.getElementById("accountType");
   if (typeSelect) {
-    typeSelect.addEventListener("change", () => applyTokenLabels(typeSelect.value));
+    typeSelect.addEventListener("change", () => {
+      applyTokenLabels(typeSelect.value);
+    });
     applyTokenLabels(typeSelect.value);
   }
 });

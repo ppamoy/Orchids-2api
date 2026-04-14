@@ -1,176 +1,198 @@
-# Orchids-2api 文档
+# Orchids-2api
 
-## 项目简介
+[中文](README.md) | [English](README_EN.md)
 
-**Orchids-2api** (orchids-api) 是一个 Go 语言编写的 API 代理服务器，提供多账号管理与负载均衡代理功能，兼容 Claude API 格式的请求转发。
+一个基于 Go 的多通道代理服务，统一暴露 Claude Messages 风格与 OpenAI 兼容接口，当前支持 `orchids`、`warp`、`bolt`、`puter`、`grok` 五类通道。
 
-### 核心功能
+## 当前状态
 
-- 多账号管理与负载均衡代理
-- 兼容 Claude API 格式的请求转发
-- 将请求代理到 Orchids 后端服务
-- 提供 Web 管理界面
+- `internal/handler` 统一处理 `orchids` / `warp` / `bolt` / `puter` 的 `/v1/messages` 与 `/v1/chat/completions`
+- `internal/grok` 独立处理 `grok` 的 `/v1/chat/completions`、`/v1/images/*`、`/v1/files/*`
+- 模型管理支持按通道刷新：`/api/models/refresh`
+- Puter 非流式 Claude Messages 已覆盖 `Read`、`Write`、`Edit`、`Delete`、长上下文、多轮 `tool_result` 回归
 
+## 核心能力
+
+- 多账号池与按通道负载均衡
+- Claude Messages 兼容接口
+- OpenAI Chat Completions 兼容接口
+- 通道级模型管理、默认模型与排序
+- 管理后台与管理 API
+- Redis 持久化存储
+- Prometheus 指标与可选 `pprof`
+- Grok 图片生成、编辑和本地媒体缓存
+
+## 支持通道
+
+| 通道 | 对外入口 |
+|---|---|
+| `orchids` | `/orchids/v1/messages`、`/orchids/v1/chat/completions` |
+| `warp` | `/warp/v1/messages`、`/warp/v1/chat/completions` |
+| `bolt` | `/bolt/v1/messages`、`/bolt/v1/chat/completions` |
+| `puter` | `/puter/v1/messages`、`/puter/v1/chat/completions` |
+| `grok` | `/grok/v1/chat/completions`、`/grok/v1/images/*`、`/grok/v1/files/*` |
+
+统一模型查询入口：
+
+- `GET /v1/models`
+- `GET /v1/models/{id}`
 
 ## 文档目录
 
-| 文档 | 描述 |
-|------|------|
-| [架构设计](./docs/architecture.md) | 目录结构、核心组件、请求流程、数据模型 |
-| [API 接口](./docs/api-reference.md) | 所有端点列表、请求/响应格式、认证说明 |
-| [部署指南](./docs/deployment.md) | 本地开发、生产部署 |
-| [配置说明](./docs/configuration.md) | 配置文件格式 |
+- [架构设计](docs/architecture.md)
+- [架构复核](docs/architecture-review.md)
+- [API 参考](docs/api-reference.md)
+- [配置说明](docs/configuration.md)
+- [部署指南](docs/deployment.md)
+- [请求流程](docs/ORCHIDS_API_FLOW.md)
+- [Grok 与 grok2api 对齐清单](docs/grok2api-parity-checklist.md)
+
+## 环境要求
+
+- Go `1.24+`
+- Redis `7+`
+- Windows / Linux / macOS
 
 ## 快速开始
 
-### 开发环境运行
+### 1. 启动 Redis
 
 ```bash
-# 1. 下载依赖
-go mod download
-
-# 2. 直接运行（开发模式）
-go run ./cmd/server/main.go -config ./config.json
+docker run -d --name orchids-redis -p 6379:6379 redis:7
 ```
 
-### 生产环境编译和运行
+### 2. 准备配置
 
-**重要提示**：本项目使用 Go embed 将静态文件（web/static）和模板文件（web/templates）嵌入到二进制文件中。因此，修改这些文件后必须重新编译才能生效。
+最小可用 `config.json`：
 
-```bash
-# 1. 编译服务器（将静态文件和模板嵌入到二进制文件）
-go build -o orchids-server ./cmd/server
-
-# 2. 运行编译后的服务器
-./orchids-server -config ./config.json
-
-# 或者后台运行
-nohup ./orchids-server -config ./config.json > server.log 2>&1 &
+```json
+{
+  "port": "3002",
+  "store_mode": "redis",
+  "redis_addr": "127.0.0.1:6379",
+  "admin_user": "admin",
+  "admin_pass": "change-me",
+  "admin_path": "/admin",
+  "debug_enabled": true
+}
 ```
 
-### 修改前端文件后的步骤
+说明：
 
-如果您修改了以下文件：
-- `web/static/` 目录下的任何文件（JS、CSS、HTML等）
-- `web/templates/` 目录下的任何模板文件
+- 未设置 `admin_pass` 时，程序会在启动时自动生成随机密码并打印日志
+- 运行后若 Redis 中存在 `settings:config`，会覆盖文件配置
 
-**必须执行以下步骤**：
+### 3. 启动服务
+
+开发模式：
 
 ```bash
-# 1. 停止正在运行的服务器
-pkill -f orchids-server
+go run ./cmd/server -config ./config.json
+```
 
-# 2. 重新编译（嵌入更新后的文件）
+生产模式：
+
+```bash
 go build -o orchids-server ./cmd/server
-
-# 3. 重新启动服务器
 ./orchids-server -config ./config.json
 ```
 
-### 快速重启脚本
+Windows：
+
+```powershell
+go build -o server.exe ./cmd/server
+.\server.exe -config .\config.json
+```
+
+## 常用命令
+
+运行全部测试：
 
 ```bash
-# 一键重新编译并启动
-(pkill -f orchids-server || true) && go build -o orchids-server ./cmd/server && ./orchids-server
-```
-
-## 主要特性
-
-1. **多账号管理** - 支持添加、编辑、删除多个 Orchids 账号
-2. **负载均衡** - 加权随机算法分配请求
-3. **故障转移** - 账号失败时自动切换
-4. **模型映射** - 透明映射 Claude 模型到上游模型
-5. **工具调用** - 完整支持 Claude Tool Use
-6. **流式响应** - SSE 实时响应
-7. **Token 计数** - 估算输入/输出 Token
-8. **调试日志** - 详细的请求/响应日志
-9. **管理界面** - Web UI 管理账号
-10. **导入导出** - 账号配置备份恢复
-
-## 项目架构
-
-```
-orchids-api/
-├── cmd/server/          # 应用入口
-│   └── main.go
-├── internal/
-│   ├── api/             # Admin REST API
-│   ├── auth/            # 认证服务
-│   ├── clerk/           # Clerk JWT 认证
-│   ├── config/          # 配置加载
-│   ├── errors/          # 统一错误处理
-│   ├── handler/         # HTTP 请求处理器
-│   │   ├── handler.go   # 核心处理逻辑
-│   │   ├── stream_handler.go  # SSE 流处理
-│   │   ├── tool_exec.go       # 工具执行
-│   │   └── tools.go           # 工具映射
-│   ├── loadbalancer/    # 加权负载均衡
-│   ├── middleware/      # HTTP 中间件
-│   │   ├── auth.go      # 认证中间件
-│   │   ├── concurrency.go  # 并发限制
-│   │   └── session.go   # 会话管理
-│   ├── orchids/         # Orchids 上游客户端
-│   │   ├── client.go    # SSE 客户端
-│   │   ├── ws_aiclient.go  # WebSocket 客户端
-│   │   ├── fs.go        # 文件系统操作
-│   │   └── tool_mapping.go # 工具名称映射
-│   ├── upstream/        # 通用上游组件
-│   │   ├── wspool.go    # WebSocket 连接池
-│   │   ├── breaker.go   # 熔断器
-│   │   └── reliability.go # 重试与可靠性
-│   ├── warp/            # Warp 上游客户端
-│   │   ├── client.go    # Warp API 客户端
-│   │   └── session.go   # Warp 会话管理
-│   ├── perf/            # 性能优化 (对象池)
-│   ├── prompt/          # Prompt 构建与压缩
-│   ├── store/           # Redis 数据存储
-│   ├── summarycache/    # 会话摘要缓存
-│   ├── tiktoken/        # Token 估算
-│   └── util/            # 通用工具函数
-├── web/                 # 嵌入式静态资源
-│   ├── static/          # CSS, JS
-│   └── templates/       # HTML 模板
-└── docs/                # 文档
-```
-
-### 请求流程
-
-```
-Client Request
-     ↓
-[Middleware] → Trace ID → Concurrency Limit → Auth
-     ↓
-[Handler] → Validate → Select Account (LoadBalancer)
-     ↓
-[Prompt Builder] → Build Markdown Prompt → Compress History
-     ↓
-[Upstream Client] → WebSocket/SSE → Orchids Server
-     ↓
-[Stream Handler] → Parse Events → Build Response → SSE to Client
-```
-
-### 核心模块说明
-
-| 模块 | 职责 |
-|------|------|
-| `orchids/` | Orchids 上游客户端，SSE/WebSocket 通信 |
-| `warp/` | Warp 上游客户端 |
-| `upstream/` | 通用上游组件：连接池、熔断器、重试 |
-| `errors/` | 统一错误码和结构化错误处理 |
-| `util/` | 并行处理、重试、可取消休眠等工具 |
-| `perf/` | 对象池复用，减少 GC 压力 |
-
-## 运行测试
-
-```bash
-# 运行所有测试
 go test ./...
-
-# 运行特定模块测试
-go test ./internal/errors/...
-go test ./internal/util/...
-go test ./internal/middleware/...
-
-# 查看覆盖率
-go test ./... -cover
 ```
+
+只跑 Puter 相关回归：
+
+```bash
+go test ./internal/handler -run "Puter_"
+```
+
+重新编译：
+
+```bash
+go build -o orchids-server ./cmd/server
+```
+
+查看健康状态：
+
+```bash
+curl -s http://127.0.0.1:3002/health
+curl -s http://127.0.0.1:3002/v1/models
+```
+
+## 模型管理说明
+
+- 管理接口：`POST /api/models/refresh`
+- 请求体示例：`{"channel":"puter"}`
+- 当前刷新策略是“按来源同步”
+- 会把来源中新增的模型写入本地模型表
+- 会把本地已存在但来源已消失的模型删除
+- 不再对每个模型单独做逐个测活；`verified` 表示本轮成功纳入同步集合的数量
+
+当前各通道模型来源：
+
+- `orchids`：上游公开模型选择列表
+- `warp`：账号 GraphQL 发现结果，失败时退回内置种子
+- `bolt`：内置种子模型
+- `puter`：Puter 公开模型列表
+- `grok`：内置支持列表 + 现存模型 + 公共文档探测
+
+## Puter 当前对齐点
+
+- `/puter/v1/messages` 非流式响应会保留 `tool_use` content block，不再返回 `content: null`
+- `tool_result` follow-up 可以继续返回新的 `tool_use`，也可以正常收敛成最终文本
+- 已有回归测试覆盖 `Read`、`Write`、`Edit`、`Delete`、长上下文、多轮 `tool_result`
+
+## 主要公开端点
+
+### Claude Messages 风格
+
+- `POST /orchids/v1/messages`
+- `POST /warp/v1/messages`
+- `POST /bolt/v1/messages`
+- `POST /puter/v1/messages`
+
+### OpenAI Chat Completions 风格
+
+- `POST /orchids/v1/chat/completions`
+- `POST /warp/v1/chat/completions`
+- `POST /bolt/v1/chat/completions`
+- `POST /puter/v1/chat/completions`
+- `POST /grok/v1/chat/completions`
+
+### Grok 图片与文件
+
+- `POST /grok/v1/images/generations`
+- `POST /grok/v1/images/edits`
+- `GET /grok/v1/files/{image|video}/{name}`
+
+## 管理端
+
+- UI：`{admin_path}/`
+- 登录：`POST /api/login`
+- 账号管理：`/api/accounts*`
+- 模型管理：`/api/models*`
+- 配置管理：`/api/config*`
+- Token 缓存：`/api/token-cache/*`
+
+管理接口认证方式：
+
+- `session_token` cookie
+- `Authorization: Bearer <admin_token>`
+- `X-Admin-Token: <admin_token>`
+- Basic Auth，密码等于 `admin_pass`
+
+## 许可证
+
+本仓库遵循仓库内现有许可策略。
